@@ -1,12 +1,15 @@
 mod de;
 mod error;
+mod json_operations;
 mod json_path;
 mod ser;
 
 use std::rc::Rc;
 
 pub use crate::json::de::from_str;
+use crate::json::de::ordered_object;
 use crate::json::error::Error as JsonError;
+pub use crate::json::json_operations::{json_patch, json_remove};
 use crate::json::json_path::{json_path, JsonPath, PathElement};
 pub use crate::json::ser::to_string;
 use crate::types::{LimboText, OwnedValue, TextSubtype};
@@ -23,7 +26,9 @@ pub enum Val {
     Float(f64),
     String(String),
     Array(Vec<Val>),
-    Object(IndexMap<String, Val>),
+    Removed,
+    #[serde(with = "ordered_object")]
+    Object(Vec<(String, Val)>),
 }
 
 pub fn get_json(json_value: &OwnedValue) -> crate::Result<OwnedValue> {
@@ -36,7 +41,7 @@ pub fn get_json(json_value: &OwnedValue) -> crate::Result<OwnedValue> {
             }
 
             let json_val = get_json_value(json_value)?;
-            let json = crate::json::to_string(&json_val).unwrap();
+            let json = to_string(&json_val).unwrap();
 
             Ok(OwnedValue::Text(LimboText::json(Rc::new(json))))
         }
@@ -52,7 +57,7 @@ pub fn get_json(json_value: &OwnedValue) -> crate::Result<OwnedValue> {
         OwnedValue::Null => Ok(OwnedValue::Null),
         _ => {
             let json_val = get_json_value(json_value)?;
-            let json = crate::json::to_string(&json_val).unwrap();
+            let json = to_string(&json_val).unwrap();
 
             Ok(OwnedValue::Text(LimboText::json(Rc::new(json))))
         }
@@ -61,7 +66,7 @@ pub fn get_json(json_value: &OwnedValue) -> crate::Result<OwnedValue> {
 
 fn get_json_value(json_value: &OwnedValue) -> crate::Result<Val> {
     match json_value {
-        OwnedValue::Text(ref t) => match crate::json::from_str::<Val>(&t.value) {
+        OwnedValue::Text(ref t) => match from_str::<Val>(&t.value) {
             Ok(json) => Ok(json),
             Err(_) => {
                 crate::bail_parse_error!("malformed JSON")
@@ -85,6 +90,8 @@ pub fn json_array(values: &[OwnedValue]) -> crate::Result<OwnedValue> {
     let mut s = String::new();
     s.push('[');
 
+    // TODO: use `convert_db_type_to_json` and map each value with that function,
+    // so we can construct a `Val::Array` with each value and then serialize it directly.
     for (idx, value) in values.iter().enumerate() {
         match value {
             OwnedValue::Blob(_) => crate::bail_constraint_error!("JSON cannot hold BLOB values"),
@@ -92,17 +99,17 @@ pub fn json_array(values: &[OwnedValue]) -> crate::Result<OwnedValue> {
                 if t.subtype == TextSubtype::Json {
                     s.push_str(&t.value);
                 } else {
-                    match crate::json::to_string(&*t.value) {
+                    match to_string(&*t.value) {
                         Ok(json) => s.push_str(&json),
                         Err(_) => crate::bail_parse_error!("malformed JSON"),
                     }
                 }
             }
-            OwnedValue::Integer(i) => match crate::json::to_string(&i) {
+            OwnedValue::Integer(i) => match to_string(&i) {
                 Ok(json) => s.push_str(&json),
                 Err(_) => crate::bail_parse_error!("malformed JSON"),
             },
-            OwnedValue::Float(f) => match crate::json::to_string(&f) {
+            OwnedValue::Float(f) => match to_string(&f) {
                 Ok(json) => s.push_str(&json),
                 Err(_) => crate::bail_parse_error!("malformed JSON"),
             },
@@ -152,7 +159,7 @@ pub fn json_arrow_extract(value: &OwnedValue, path: &OwnedValue) -> crate::Resul
     let extracted = json_extract_single(&json, path, false)?;
 
     if let Some(val) = extracted {
-        let json = crate::json::to_string(val).unwrap();
+        let json = to_string(val).unwrap();
 
         Ok(OwnedValue::Text(LimboText::json(Rc::new(json))))
     } else {
@@ -190,7 +197,7 @@ pub fn json_extract(value: &OwnedValue, paths: &[OwnedValue]) -> crate::Result<O
         let json = get_json_value(value)?;
         let extracted = json_extract_single(&json, &paths[0], true)?.unwrap_or_else(|| &Val::Null);
 
-        return convert_json_to_db_type(&extracted, false);
+        return convert_json_to_db_type(extracted, false);
     }
 
     let json = get_json_value(value)?;
@@ -209,7 +216,7 @@ pub fn json_extract(value: &OwnedValue, paths: &[OwnedValue]) -> crate::Result<O
                     return Ok(OwnedValue::Null);
                 }
 
-                result.push_str(&crate::json::to_string(&extracted).unwrap());
+                result.push_str(&to_string(&extracted).unwrap());
                 result.push(',');
             }
         }
@@ -228,11 +235,13 @@ pub fn json_extract(value: &OwnedValue, paths: &[OwnedValue]) -> crate::Result<O
 ///   > an INTEGER one for a JSON true value,
 ///   > the dequoted text for a JSON string value,
 ///   > and a text representation for JSON object and array values.
+///
 /// https://sqlite.org/json1.html#the_json_extract_function
 ///
 /// *all_as_db* - if true, objects and arrays will be returned as pure TEXT without the JSON subtype
 fn convert_json_to_db_type(extracted: &Val, all_as_db: bool) -> crate::Result<OwnedValue> {
     match extracted {
+        Val::Removed => Ok(OwnedValue::Null),
         Val::Null => Ok(OwnedValue::Null),
         Val::Float(f) => Ok(OwnedValue::Float(*f)),
         Val::Integer(i) => Ok(OwnedValue::Integer(*i)),
@@ -245,7 +254,7 @@ fn convert_json_to_db_type(extracted: &Val, all_as_db: bool) -> crate::Result<Ow
         }
         Val::String(s) => Ok(OwnedValue::Text(LimboText::new(Rc::new(s.clone())))),
         _ => {
-            let json = crate::json::to_string(&extracted).unwrap();
+            let json = to_string(&extracted).unwrap();
             if all_as_db {
                 Ok(OwnedValue::Text(LimboText::new(Rc::new(json))))
             } else {
@@ -253,6 +262,29 @@ fn convert_json_to_db_type(extracted: &Val, all_as_db: bool) -> crate::Result<Ow
             }
         }
     }
+}
+
+/// Converts a DB value (`OwnedValue`) to a JSON representation (`Val`).
+/// Note that when the internal text value is a json,
+/// the returned `Val` will be an object. If the internal text value is a regular text,
+/// then a string will be returned. This is useful to track if the value came from a json
+/// function and therefore we must interpret it as json instead of raw text when working with it.
+fn convert_db_type_to_json(value: &OwnedValue) -> crate::Result<Val> {
+    let val = match value {
+        OwnedValue::Null => Val::Null,
+        OwnedValue::Float(f) => Val::Float(*f),
+        OwnedValue::Integer(i) => Val::Integer(*i),
+        OwnedValue::Text(t) => match t.subtype {
+            // Convert only to json if the subtype is json (if we got it from another json function)
+            TextSubtype::Json => get_json_value(value)?,
+            TextSubtype::Text => Val::String(t.value.to_string()),
+        },
+        OwnedValue::Blob(_) => crate::bail_constraint_error!("JSON cannot hold BLOB values"),
+        unsupported_value => crate::bail_constraint_error!(
+            "JSON cannot hold this type of value: {unsupported_value:?}"
+        ),
+    };
+    Ok(val)
 }
 
 pub fn json_type(value: &OwnedValue, path: Option<&OwnedValue>) -> crate::Result<OwnedValue> {
@@ -285,6 +317,7 @@ pub fn json_type(value: &OwnedValue, path: Option<&OwnedValue>) -> crate::Result
         Val::String(_) => "text",
         Val::Array(_) => "array",
         Val::Object(_) => "object",
+        Val::Removed => unreachable!(),
     };
 
     Ok(OwnedValue::Text(LimboText::json(Rc::new(val.to_string()))))
@@ -341,7 +374,7 @@ fn json_extract_single<'a>(
 
                 match current_element {
                     Val::Object(map) => {
-                        if let Some(value) = map.get(key) {
+                        if let Some((_, value)) = map.iter().find(|(k, _)| k == key) {
                             current_element = value;
                         } else {
                             return Ok(None);
@@ -369,12 +402,70 @@ fn json_extract_single<'a>(
         }
     }
 
-    Ok(Some(&current_element))
+    Ok(Some(current_element))
+}
+
+enum Target<'a> {
+    Array(&'a mut Vec<Val>, usize),
+    Value(&'a mut Val),
+}
+
+fn mutate_json_by_path<F, R>(json: &mut Val, path: JsonPath, closure: F) -> Option<R>
+where
+    F: FnMut(Target) -> R,
+{
+    find_target(json, &path).map(closure)
+}
+
+fn find_target<'a>(json: &'a mut Val, path: &JsonPath) -> Option<Target<'a>> {
+    let mut current = json;
+    for (i, key) in path.elements.iter().enumerate() {
+        let is_last = i == path.elements.len() - 1;
+        match key {
+            PathElement::Root() => continue,
+            PathElement::ArrayLocator(index) => match current {
+                Val::Array(arr) => {
+                    if let Some(index) = match index {
+                        i if *i < 0 => arr.len().checked_sub(i.unsigned_abs() as usize),
+                        i => ((*i as usize) < arr.len()).then_some(*i as usize),
+                    } {
+                        if is_last {
+                            return Some(Target::Array(arr, index));
+                        } else {
+                            current = &mut arr[index];
+                        }
+                    } else {
+                        return None;
+                    }
+                }
+                _ => {
+                    return None;
+                }
+            },
+            PathElement::Key(key) => match current {
+                Val::Object(obj) => {
+                    if let Some(pos) = &obj
+                        .iter()
+                        .position(|(k, v)| k == key && !matches!(v, Val::Removed))
+                    {
+                        let val = &mut obj[*pos].1;
+                        current = val;
+                    } else {
+                        return None;
+                    }
+                }
+                _ => {
+                    return None;
+                }
+            },
+        }
+    }
+    Some(Target::Value(current))
 }
 
 pub fn json_error_position(json: &OwnedValue) -> crate::Result<OwnedValue> {
     match json {
-        OwnedValue::Text(t) => match crate::json::from_str::<Val>(&t.value) {
+        OwnedValue::Text(t) => match from_str::<Val>(&t.value) {
             Ok(_) => Ok(OwnedValue::Integer(0)),
             Err(JsonError::Message { location, .. }) => {
                 if let Some(loc) = location {
@@ -395,6 +486,45 @@ pub fn json_error_position(json: &OwnedValue) -> crate::Result<OwnedValue> {
         },
         OwnedValue::Null => Ok(OwnedValue::Null),
         _ => Ok(OwnedValue::Integer(0)),
+    }
+}
+
+/// Constructs a JSON object from a list of values that represent key-value pairs.
+/// The number of values must be even, and the first value of each pair (which represents the map key)
+/// must be a TEXT value. The second value of each pair can be any JSON value (which represents the map value)
+pub fn json_object(values: &[OwnedValue]) -> crate::Result<OwnedValue> {
+    let value_map = values
+        .chunks(2)
+        .map(|chunk| match chunk {
+            [key, value] => {
+                let key = match key {
+                    OwnedValue::Text(t) => t.value.to_string(),
+                    _ => crate::bail_constraint_error!("labels must be TEXT"),
+                };
+                let json_val = convert_db_type_to_json(value)?;
+
+                Ok((key, json_val))
+            }
+            _ => crate::bail_constraint_error!("json_object requires an even number of values"),
+        })
+        .collect::<Result<IndexMap<String, Val>, _>>()?;
+
+    let result = crate::json::to_string(&value_map).unwrap();
+    Ok(OwnedValue::Text(LimboText::json(Rc::new(result))))
+}
+
+pub fn is_json_valid(json_value: &OwnedValue) -> crate::Result<OwnedValue> {
+    match json_value {
+        OwnedValue::Text(ref t) => match from_str::<Val>(&t.value) {
+            Ok(_) => Ok(OwnedValue::Integer(1)),
+            Err(_) => Ok(OwnedValue::Integer(0)),
+        },
+        OwnedValue::Blob(b) => match jsonb::from_slice(b) {
+            Ok(_) => Ok(OwnedValue::Integer(1)),
+            Err(_) => Ok(OwnedValue::Integer(0)),
+        },
+        OwnedValue::Null => Ok(OwnedValue::Null),
+        _ => Ok(OwnedValue::Integer(1)),
     }
 }
 
@@ -781,5 +911,250 @@ mod tests {
         let input = OwnedValue::Blob(Rc::new(r#"["a",55,"b",72,,]"#.as_bytes().to_owned()));
         let result = json_error_position(&input).unwrap();
         assert_eq!(result, OwnedValue::Integer(16));
+    }
+
+    #[test]
+    fn test_json_object_simple() {
+        let key = OwnedValue::build_text(Rc::new("key".to_string()));
+        let value = OwnedValue::build_text(Rc::new("value".to_string()));
+        let input = vec![key, value];
+
+        let result = json_object(&input).unwrap();
+        let OwnedValue::Text(json_text) = result else {
+            panic!("Expected OwnedValue::Text");
+        };
+        assert_eq!(json_text.value.as_str(), r#"{"key":"value"}"#);
+    }
+
+    #[test]
+    fn test_json_object_multiple_values() {
+        let text_key = OwnedValue::build_text(Rc::new("text_key".to_string()));
+        let text_value = OwnedValue::build_text(Rc::new("text_value".to_string()));
+        let json_key = OwnedValue::build_text(Rc::new("json_key".to_string()));
+        let json_value = OwnedValue::Text(LimboText::json(Rc::new(
+            r#"{"json":"value","number":1}"#.to_string(),
+        )));
+        let integer_key = OwnedValue::build_text(Rc::new("integer_key".to_string()));
+        let integer_value = OwnedValue::Integer(1);
+        let float_key = OwnedValue::build_text(Rc::new("float_key".to_string()));
+        let float_value = OwnedValue::Float(1.1);
+        let null_key = OwnedValue::build_text(Rc::new("null_key".to_string()));
+        let null_value = OwnedValue::Null;
+
+        let input = vec![
+            text_key,
+            text_value,
+            json_key,
+            json_value,
+            integer_key,
+            integer_value,
+            float_key,
+            float_value,
+            null_key,
+            null_value,
+        ];
+
+        let result = json_object(&input).unwrap();
+        let OwnedValue::Text(json_text) = result else {
+            panic!("Expected OwnedValue::Text");
+        };
+        assert_eq!(
+            json_text.value.as_str(),
+            r#"{"text_key":"text_value","json_key":{"json":"value","number":1},"integer_key":1,"float_key":1.1,"null_key":null}"#
+        );
+    }
+
+    #[test]
+    fn test_json_object_json_value_is_rendered_as_json() {
+        let key = OwnedValue::build_text(Rc::new("key".to_string()));
+        let value = OwnedValue::Text(LimboText::json(Rc::new(r#"{"json":"value"}"#.to_string())));
+        let input = vec![key, value];
+
+        let result = json_object(&input).unwrap();
+        let OwnedValue::Text(json_text) = result else {
+            panic!("Expected OwnedValue::Text");
+        };
+        assert_eq!(json_text.value.as_str(), r#"{"key":{"json":"value"}}"#);
+    }
+
+    #[test]
+    fn test_json_object_json_text_value_is_rendered_as_regular_text() {
+        let key = OwnedValue::build_text(Rc::new("key".to_string()));
+        let value = OwnedValue::Text(LimboText::new(Rc::new(r#"{"json":"value"}"#.to_string())));
+        let input = vec![key, value];
+
+        let result = json_object(&input).unwrap();
+        let OwnedValue::Text(json_text) = result else {
+            panic!("Expected OwnedValue::Text");
+        };
+        assert_eq!(
+            json_text.value.as_str(),
+            r#"{"key":"{\"json\":\"value\"}"}"#
+        );
+    }
+
+    #[test]
+    fn test_json_object_nested() {
+        let key = OwnedValue::build_text(Rc::new("key".to_string()));
+        let value = OwnedValue::build_text(Rc::new("value".to_string()));
+        let input = vec![key, value];
+
+        let parent_key = OwnedValue::build_text(Rc::new("parent_key".to_string()));
+        let parent_value = json_object(&input).unwrap();
+        let parent_input = vec![parent_key, parent_value];
+
+        let result = json_object(&parent_input).unwrap();
+
+        let OwnedValue::Text(json_text) = result else {
+            panic!("Expected OwnedValue::Text");
+        };
+        assert_eq!(
+            json_text.value.as_str(),
+            r#"{"parent_key":{"key":"value"}}"#
+        );
+    }
+
+    #[test]
+    fn test_json_object_duplicated_keys() {
+        let key = OwnedValue::build_text(Rc::new("key".to_string()));
+        let value = OwnedValue::build_text(Rc::new("value".to_string()));
+        let input = vec![key.clone(), value.clone(), key, value];
+
+        let result = json_object(&input).unwrap();
+        let OwnedValue::Text(json_text) = result else {
+            panic!("Expected OwnedValue::Text");
+        };
+        assert_eq!(json_text.value.as_str(), r#"{"key":"value"}"#);
+    }
+
+    #[test]
+    fn test_json_object_empty() {
+        let input = vec![];
+
+        let result = json_object(&input).unwrap();
+        let OwnedValue::Text(json_text) = result else {
+            panic!("Expected OwnedValue::Text");
+        };
+        assert_eq!(json_text.value.as_str(), r#"{}"#);
+    }
+
+    #[test]
+    fn test_json_object_non_text_key() {
+        let key = OwnedValue::Integer(1);
+        let value = OwnedValue::build_text(Rc::new("value".to_string()));
+        let input = vec![key, value];
+
+        match json_object(&input) {
+            Ok(_) => panic!("Expected error for non-TEXT key"),
+            Err(e) => assert!(e.to_string().contains("labels must be TEXT")),
+        }
+    }
+
+    #[test]
+    fn test_json_odd_number_of_values() {
+        let key = OwnedValue::build_text(Rc::new("key".to_string()));
+        let value = OwnedValue::build_text(Rc::new("value".to_string()));
+        let input = vec![key.clone(), value, key];
+
+        match json_object(&input) {
+            Ok(_) => panic!("Expected error for odd number of values"),
+            Err(e) => assert!(e
+                .to_string()
+                .contains("json_object requires an even number of values")),
+        }
+    }
+
+    #[test]
+    fn test_find_target_array() {
+        let mut val = Val::Array(vec![
+            Val::String("first".to_string()),
+            Val::String("second".to_string()),
+        ]);
+        let path = JsonPath {
+            elements: vec![PathElement::ArrayLocator(0)],
+        };
+
+        match find_target(&mut val, &path) {
+            Some(Target::Array(_, idx)) => assert_eq!(idx, 0),
+            _ => panic!("Expected Array target"),
+        }
+    }
+
+    #[test]
+    fn test_find_target_negative_index() {
+        let mut val = Val::Array(vec![
+            Val::String("first".to_string()),
+            Val::String("second".to_string()),
+        ]);
+        let path = JsonPath {
+            elements: vec![PathElement::ArrayLocator(-1)],
+        };
+
+        match find_target(&mut val, &path) {
+            Some(Target::Array(_, idx)) => assert_eq!(idx, 1),
+            _ => panic!("Expected Array target"),
+        }
+    }
+
+    #[test]
+    fn test_find_target_object() {
+        let mut val = Val::Object(vec![("key".to_string(), Val::String("value".to_string()))]);
+        let path = JsonPath {
+            elements: vec![PathElement::Key("key".to_string())],
+        };
+
+        match find_target(&mut val, &path) {
+            Some(Target::Value(_)) => {}
+            _ => panic!("Expected Value target"),
+        }
+    }
+
+    #[test]
+    fn test_find_target_removed() {
+        let mut val = Val::Object(vec![
+            ("key".to_string(), Val::Removed),
+            ("key".to_string(), Val::String("value".to_string())),
+        ]);
+        let path = JsonPath {
+            elements: vec![PathElement::Key("key".to_string())],
+        };
+
+        match find_target(&mut val, &path) {
+            Some(Target::Value(val)) => assert!(matches!(val, Val::String(_))),
+            _ => panic!("Expected second value, not removed"),
+        }
+    }
+
+    #[test]
+    fn test_mutate_json() {
+        let mut val = Val::Array(vec![Val::String("test".to_string())]);
+        let path = JsonPath {
+            elements: vec![PathElement::ArrayLocator(0)],
+        };
+
+        let result = mutate_json_by_path(&mut val, path, |target| match target {
+            Target::Array(arr, idx) => {
+                arr.remove(idx);
+                "removed"
+            }
+            _ => panic!("Expected Array target"),
+        });
+
+        assert_eq!(result, Some("removed"));
+        assert!(matches!(val, Val::Array(arr) if arr.is_empty()));
+    }
+
+    #[test]
+    fn test_mutate_json_none() {
+        let mut val = Val::Array(vec![]);
+        let path = JsonPath {
+            elements: vec![PathElement::ArrayLocator(0)],
+        };
+
+        let result: Option<()> = mutate_json_by_path(&mut val, path, |_| {
+            panic!("Should not be called");
+        });
+
+        assert_eq!(result, None);
     }
 }

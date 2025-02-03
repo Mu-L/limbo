@@ -165,12 +165,16 @@ pub fn emit_group_by<'a>(
             .map(|agg| agg.args.len())
             .sum::<usize>();
     // sorter column names do not matter
+    let ty = crate::schema::Type::Null;
     let pseudo_columns = (0..sorter_column_count)
         .map(|i| Column {
             name: i.to_string(),
             primary_key: false,
-            ty: crate::schema::Type::Null,
+            ty,
+            ty_str: ty.to_string(),
             is_rowid_alias: false,
+            notnull: false,
+            default: None,
         })
         .collect::<Vec<_>>();
 
@@ -270,7 +274,7 @@ pub fn emit_group_by<'a>(
         let agg_result_reg = start_reg + i;
         translate_aggregation_step_groupby(
             program,
-            &plan.referenced_tables,
+            &plan.table_references,
             pseudo_cursor,
             cursor_index,
             agg,
@@ -288,7 +292,7 @@ pub fn emit_group_by<'a>(
     program.emit_insn(Insn::If {
         target_pc: label_acc_indicator_set_flag_true,
         reg: reg_data_in_acc_flag,
-        null_reg: 0, // unused in this case
+        jump_if_null: false,
     });
 
     // Read the group by columns for a finished group
@@ -380,7 +384,7 @@ pub fn emit_group_by<'a>(
         for expr in having.iter() {
             translate_condition_expr(
                 program,
-                &plan.referenced_tables,
+                &plan.table_references,
                 expr,
                 ConditionMetadata {
                     jump_if_condition_is_true: false,
@@ -394,7 +398,13 @@ pub fn emit_group_by<'a>(
 
     match &plan.order_by {
         None => {
-            emit_select_result(program, t_ctx, plan, Some(label_group_by_end))?;
+            emit_select_result(
+                program,
+                t_ctx,
+                plan,
+                Some(label_group_by_end),
+                Some(group_by_end_without_emitting_row_label),
+            )?;
         }
         Some(_) => {
             order_by_sorter_insert(program, t_ctx, plan)?;
@@ -463,14 +473,18 @@ pub fn translate_aggregation_step_groupby(
             });
             target_register
         }
-        AggFunc::Count => {
+        AggFunc::Count | AggFunc::Count0 => {
             let expr_reg = program.alloc_register();
             emit_column(program, expr_reg);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: AggFunc::Count,
+                func: if matches!(agg.func, AggFunc::Count0) {
+                    AggFunc::Count0
+                } else {
+                    AggFunc::Count
+                },
             });
             target_register
         }
@@ -605,6 +619,9 @@ pub fn translate_aggregation_step_groupby(
                 func: AggFunc::Total,
             });
             target_register
+        }
+        AggFunc::External(_) => {
+            todo!("External aggregate functions are not yet supported in GROUP BY");
         }
     };
     Ok(dest)

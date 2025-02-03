@@ -5,11 +5,15 @@ use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc};
 use crate::schema::Type;
 use crate::util::normalize_ident;
-use crate::vdbe::{builder::ProgramBuilder, insn::Insn, BranchOffset};
+use crate::vdbe::{
+    builder::ProgramBuilder,
+    insn::{CmpInsFlags, Insn},
+    BranchOffset,
+};
 use crate::Result;
 
 use super::emitter::Resolver;
-use super::plan::{TableReference, TableReferenceType};
+use super::plan::{Operation, TableReference};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ConditionMetadata {
@@ -23,13 +27,13 @@ fn emit_cond_jump(program: &mut ProgramBuilder, cond_meta: ConditionMetadata, re
         program.emit_insn(Insn::If {
             reg,
             target_pc: cond_meta.jump_target_when_true,
-            null_reg: reg,
+            jump_if_null: false,
         });
     } else {
         program.emit_insn(Insn::IfNot {
             reg,
             target_pc: cond_meta.jump_target_when_false,
-            null_reg: reg,
+            jump_if_null: true,
         });
     }
 }
@@ -47,12 +51,41 @@ macro_rules! emit_cmp_insn {
                 lhs: $lhs,
                 rhs: $rhs,
                 target_pc: $cond.jump_target_when_true,
+                flags: CmpInsFlags::default(),
             });
         } else {
             $program.emit_insn(Insn::$op_false {
                 lhs: $lhs,
                 rhs: $rhs,
                 target_pc: $cond.jump_target_when_false,
+                flags: CmpInsFlags::default().jump_if_null(),
+            });
+        }
+    }};
+}
+
+macro_rules! emit_cmp_null_insn {
+    (
+        $program:expr,
+        $cond:expr,
+        $op_true:ident,
+        $op_false:ident,
+        $lhs:expr,
+        $rhs:expr
+    ) => {{
+        if $cond.jump_if_condition_is_true {
+            $program.emit_insn(Insn::$op_true {
+                lhs: $lhs,
+                rhs: $rhs,
+                target_pc: $cond.jump_target_when_true,
+                flags: CmpInsFlags::default().null_eq(),
+            });
+        } else {
+            $program.emit_insn(Insn::$op_false {
+                lhs: $lhs,
+                rhs: $rhs,
+                target_pc: $cond.jump_target_when_false,
+                flags: CmpInsFlags::default().null_eq(),
             });
         }
     }};
@@ -122,6 +155,24 @@ macro_rules! expect_arguments_min {
         } else {
             crate::bail_parse_error!("{} function with no arguments", $func.to_string());
         };
+        args
+    }};
+}
+
+macro_rules! expect_arguments_even {
+    (
+        $args:expr,
+        $func:ident
+    ) => {{
+        let args = $args.as_deref().unwrap_or_default();
+        if args.len() % 2 != 0 {
+            crate::bail_parse_error!(
+                "{} function requires an even number of arguments",
+                $func.to_string()
+            );
+        };
+        // The only function right now that requires an even number is `json_object` and it allows
+        // to have no arguments, so thats why in this macro we do not bail with teh `function with no arguments` error
         args
     }};
 }
@@ -206,8 +257,12 @@ pub fn translate_condition_expr(
                 ast::Operator::NotEquals => {
                     emit_cmp_insn!(program, condition_metadata, Ne, Eq, lhs_reg, rhs_reg)
                 }
-                ast::Operator::Is => todo!(),
-                ast::Operator::IsNot => todo!(),
+                ast::Operator::Is => {
+                    emit_cmp_null_insn!(program, condition_metadata, Eq, Ne, lhs_reg, rhs_reg)
+                }
+                ast::Operator::IsNot => {
+                    emit_cmp_null_insn!(program, condition_metadata, Ne, Eq, lhs_reg, rhs_reg)
+                }
                 _ => {
                     todo!("op {:?} not implemented", op);
                 }
@@ -306,6 +361,7 @@ pub fn translate_condition_expr(
                             lhs: lhs_reg,
                             rhs: rhs_reg,
                             target_pc: jump_target_when_true,
+                            flags: CmpInsFlags::default(),
                         });
                     } else {
                         // If this is the last condition, we need to jump to the 'jump_target_when_false' label if there is no match.
@@ -313,6 +369,7 @@ pub fn translate_condition_expr(
                             lhs: lhs_reg,
                             rhs: rhs_reg,
                             target_pc: condition_metadata.jump_target_when_false,
+                            flags: CmpInsFlags::default().jump_if_null(),
                         });
                     }
                 }
@@ -333,6 +390,7 @@ pub fn translate_condition_expr(
                         lhs: lhs_reg,
                         rhs: rhs_reg,
                         target_pc: condition_metadata.jump_target_when_false,
+                        flags: CmpInsFlags::default().jump_if_null(),
                     });
                 }
                 // If we got here, then none of the conditions were a match, so we jump to the 'jump_target_when_true' label if 'jump_if_condition_is_true'.
@@ -396,13 +454,13 @@ pub fn translate_condition_expr(
                 program.emit_insn(Insn::IfNot {
                     reg: cur_reg,
                     target_pc: condition_metadata.jump_target_when_true,
-                    null_reg: cur_reg,
+                    jump_if_null: false,
                 });
             } else {
                 program.emit_insn(Insn::If {
                     reg: cur_reg,
                     target_pc: condition_metadata.jump_target_when_false,
-                    null_reg: cur_reg,
+                    jump_if_null: true,
                 });
             }
         }
@@ -420,6 +478,22 @@ pub fn translate_condition_expr(
                     "parenthesized condtional should have exactly one expression"
                 );
             }
+        }
+        ast::Expr::NotNull(expr) => {
+            let cur_reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), expr, cur_reg, resolver)?;
+            program.emit_insn(Insn::IsNull {
+                reg: cur_reg,
+                target_pc: condition_metadata.jump_target_when_false,
+            });
+        }
+        ast::Expr::IsNull(expr) => {
+            let cur_reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), expr, cur_reg, resolver)?;
+            program.emit_insn(Insn::NotNull {
+                reg: cur_reg,
+                target_pc: condition_metadata.jump_target_when_false,
+            });
         }
         _ => todo!("op {:?} not implemented", expr),
     }
@@ -453,80 +527,98 @@ pub fn translate_expr(
             match op {
                 ast::Operator::NotEquals => {
                     let if_true_label = program.allocate_label();
-                    wrap_eval_jump_expr(
+                    wrap_eval_jump_expr_zero_or_null(
                         program,
                         Insn::Ne {
                             lhs: e1_reg,
                             rhs: e2_reg,
                             target_pc: if_true_label,
+                            flags: CmpInsFlags::default(),
                         },
                         target_register,
                         if_true_label,
+                        e1_reg,
+                        e2_reg,
                     );
                 }
                 ast::Operator::Equals => {
                     let if_true_label = program.allocate_label();
-                    wrap_eval_jump_expr(
+                    wrap_eval_jump_expr_zero_or_null(
                         program,
                         Insn::Eq {
                             lhs: e1_reg,
                             rhs: e2_reg,
                             target_pc: if_true_label,
+                            flags: CmpInsFlags::default(),
                         },
                         target_register,
                         if_true_label,
+                        e1_reg,
+                        e2_reg,
                     );
                 }
                 ast::Operator::Less => {
                     let if_true_label = program.allocate_label();
-                    wrap_eval_jump_expr(
+                    wrap_eval_jump_expr_zero_or_null(
                         program,
                         Insn::Lt {
                             lhs: e1_reg,
                             rhs: e2_reg,
                             target_pc: if_true_label,
+                            flags: CmpInsFlags::default(),
                         },
                         target_register,
                         if_true_label,
+                        e1_reg,
+                        e2_reg,
                     );
                 }
                 ast::Operator::LessEquals => {
                     let if_true_label = program.allocate_label();
-                    wrap_eval_jump_expr(
+                    wrap_eval_jump_expr_zero_or_null(
                         program,
                         Insn::Le {
                             lhs: e1_reg,
                             rhs: e2_reg,
                             target_pc: if_true_label,
+                            flags: CmpInsFlags::default(),
                         },
                         target_register,
                         if_true_label,
+                        e1_reg,
+                        e2_reg,
                     );
                 }
                 ast::Operator::Greater => {
                     let if_true_label = program.allocate_label();
-                    wrap_eval_jump_expr(
+                    wrap_eval_jump_expr_zero_or_null(
                         program,
                         Insn::Gt {
                             lhs: e1_reg,
                             rhs: e2_reg,
                             target_pc: if_true_label,
+                            flags: CmpInsFlags::default(),
                         },
                         target_register,
                         if_true_label,
+                        e1_reg,
+                        e2_reg,
                     );
                 }
                 ast::Operator::GreaterEquals => {
                     let if_true_label = program.allocate_label();
-                    wrap_eval_jump_expr(
+                    wrap_eval_jump_expr_zero_or_null(
                         program,
                         Insn::Ge {
                             lhs: e1_reg,
                             rhs: e2_reg,
                             target_pc: if_true_label,
+                            flags: CmpInsFlags::default(),
                         },
                         target_register,
                         if_true_label,
+                        e1_reg,
+                        e2_reg,
                     );
                 }
                 ast::Operator::Add => {
@@ -564,6 +656,20 @@ pub fn translate_expr(
                         dest: target_register,
                     });
                 }
+                ast::Operator::And => {
+                    program.emit_insn(Insn::And {
+                        lhs: e1_reg,
+                        rhs: e2_reg,
+                        dest: target_register,
+                    });
+                }
+                ast::Operator::Or => {
+                    program.emit_insn(Insn::Or {
+                        lhs: e1_reg,
+                        rhs: e2_reg,
+                        dest: target_register,
+                    });
+                }
                 ast::Operator::BitwiseAnd => {
                     program.emit_insn(Insn::BitAnd {
                         lhs: e1_reg,
@@ -592,6 +698,34 @@ pub fn translate_expr(
                         dest: target_register,
                     });
                 }
+                ast::Operator::Is => {
+                    let if_true_label = program.allocate_label();
+                    wrap_eval_jump_expr(
+                        program,
+                        Insn::Eq {
+                            lhs: e1_reg,
+                            rhs: e2_reg,
+                            target_pc: if_true_label,
+                            flags: CmpInsFlags::default().null_eq(),
+                        },
+                        target_register,
+                        if_true_label,
+                    );
+                }
+                ast::Operator::IsNot => {
+                    let if_true_label = program.allocate_label();
+                    wrap_eval_jump_expr(
+                        program,
+                        Insn::Ne {
+                            lhs: e1_reg,
+                            rhs: e2_reg,
+                            target_pc: if_true_label,
+                            flags: CmpInsFlags::default().null_eq(),
+                        },
+                        target_register,
+                        if_true_label,
+                    );
+                }
                 #[cfg(feature = "json")]
                 op @ (ast::Operator::ArrowRight | ast::Operator::ArrowRightShift) => {
                     let json_func = match op {
@@ -609,6 +743,13 @@ pub fn translate_expr(
                             arg_count: 2,
                         },
                     })
+                }
+                ast::Operator::Concat => {
+                    program.emit_insn(Insn::Concat {
+                        lhs: e1_reg,
+                        rhs: e2_reg,
+                        dest: target_register,
+                    });
                 }
                 other_unimplemented => todo!("{:?}", other_unimplemented),
             }
@@ -650,12 +791,13 @@ pub fn translate_expr(
                         lhs: base_reg,
                         rhs: expr_reg,
                         target_pc: next_case_label,
+                        flags: CmpInsFlags::default(),
                     }),
                     // CASE WHEN 0 THEN 0 ELSE 1 becomes ifnot 0 branch to next clause
                     None => program.emit_insn(Insn::IfNot {
                         reg: expr_reg,
                         target_pc: next_case_label,
-                        null_reg: 1,
+                        jump_if_null: true,
                     }),
                 };
                 // THEN...
@@ -742,14 +884,16 @@ pub fn translate_expr(
                 }
                 Func::External(_) => {
                     let regs = program.alloc_registers(args_count);
-                    for (i, arg_expr) in args.iter().enumerate() {
-                        translate_expr(
-                            program,
-                            referenced_tables,
-                            &arg_expr[i],
-                            regs + i,
-                            resolver,
-                        )?;
+                    if let Some(args) = args {
+                        for (i, arg_expr) in args.iter().enumerate() {
+                            translate_expr(
+                                program,
+                                referenced_tables,
+                                arg_expr,
+                                regs + i,
+                                resolver,
+                            )?;
+                        }
                     }
                     program.emit_insn(Insn::Function {
                         constant_mask: 0,
@@ -819,6 +963,53 @@ pub fn translate_expr(
                         program.emit_insn(Insn::Function {
                             constant_mask: 0,
                             start_reg: json_reg,
+                            dest: target_register,
+                            func: func_ctx,
+                        });
+                        Ok(target_register)
+                    }
+                    JsonFunc::JsonObject => {
+                        let args = expect_arguments_even!(args, j);
+
+                        translate_function(
+                            program,
+                            &args,
+                            referenced_tables,
+                            resolver,
+                            target_register,
+                            func_ctx,
+                        )
+                    }
+                    JsonFunc::JsonValid => translate_function(
+                        program,
+                        args.as_deref().unwrap_or_default(),
+                        referenced_tables,
+                        resolver,
+                        target_register,
+                        func_ctx,
+                    ),
+                    JsonFunc::JsonPatch => {
+                        let args = expect_arguments_exact!(args, 2, j);
+                        translate_function(
+                            program,
+                            args,
+                            referenced_tables,
+                            resolver,
+                            target_register,
+                            func_ctx,
+                        )
+                    }
+                    JsonFunc::JsonRemove => {
+                        if let Some(args) = args {
+                            for arg in args.iter() {
+                                // register containing result of each argument expression
+                                let _ =
+                                    translate_and_mark(program, referenced_tables, arg, resolver)?;
+                            }
+                        }
+                        program.emit_insn(Insn::Function {
+                            constant_mask: 0,
+                            start_reg: target_register + 1,
                             dest: target_register,
                             func: func_ctx,
                         });
@@ -995,7 +1186,7 @@ pub fn translate_expr(
                             program.emit_insn(Insn::IfNot {
                                 reg: temp_reg,
                                 target_pc: jump_target_when_false,
-                                null_reg: 1,
+                                jump_if_null: true,
                             });
                             translate_expr(
                                 program,
@@ -1379,6 +1570,28 @@ pub fn translate_expr(
                             });
                             Ok(target_register)
                         }
+                        ScalarFunc::SqliteSourceId => {
+                            if args.is_some() {
+                                crate::bail_parse_error!(
+                                    "sqlite_source_id function with arguments"
+                                );
+                            }
+
+                            let output_register = program.alloc_register();
+                            program.emit_insn(Insn::Function {
+                                constant_mask: 0,
+                                start_reg: output_register,
+                                dest: output_register,
+                                func: func_ctx,
+                            });
+
+                            program.emit_insn(Insn::Copy {
+                                src_reg: output_register,
+                                dst_reg: target_register,
+                                amount: 0,
+                            });
+                            Ok(target_register)
+                        }
                         ScalarFunc::Replace => {
                             let args = if let Some(args) = args {
                                 if !args.len() == 3 {
@@ -1421,6 +1634,26 @@ pub fn translate_expr(
                             program.emit_insn(Insn::Function {
                                 constant_mask: 0,
                                 start_reg: str_reg,
+                                dest: target_register,
+                                func: func_ctx,
+                            });
+                            Ok(target_register)
+                        }
+                        ScalarFunc::StrfTime => {
+                            if let Some(args) = args {
+                                for arg in args.iter() {
+                                    // register containing result of each argument expression
+                                    let _ = translate_and_mark(
+                                        program,
+                                        referenced_tables,
+                                        arg,
+                                        resolver,
+                                    )?;
+                                }
+                            }
+                            program.emit_insn(Insn::Function {
+                                constant_mask: 0,
+                                start_reg: target_register + 1,
                                 dest: target_register,
                                 func: func_ctx,
                             });
@@ -1493,19 +1726,24 @@ pub fn translate_expr(
             }
         }
         ast::Expr::FunctionCallStar { .. } => todo!(),
-        ast::Expr::Id(_) => unreachable!("Id should be resolved to a Column before translation"),
+        ast::Expr::Id(id) => {
+            crate::bail_parse_error!(
+                "no such column: {} - should this be a string literal in single-quotes?",
+                id.0
+            )
+        }
         ast::Expr::Column {
             database: _,
             table,
             column,
             is_rowid_alias,
         } => {
-            let tbl_ref = referenced_tables.as_ref().unwrap().get(*table).unwrap();
-            match tbl_ref.reference_type {
+            let table_reference = referenced_tables.as_ref().unwrap().get(*table).unwrap();
+            match table_reference.op {
                 // If we are reading a column from a table, we find the cursor that corresponds to
                 // the table and read the column from the cursor.
-                TableReferenceType::BTreeTable => {
-                    let cursor_id = program.resolve_cursor_id(&tbl_ref.table_identifier);
+                Operation::Scan { .. } | Operation::Search(_) => {
+                    let cursor_id = program.resolve_cursor_id(&table_reference.identifier);
                     if *is_rowid_alias {
                         program.emit_insn(Insn::RowId {
                             cursor_id,
@@ -1518,13 +1756,13 @@ pub fn translate_expr(
                             dest: target_register,
                         });
                     }
-                    let column = tbl_ref.table.get_column_at(*column);
+                    let column = table_reference.table.get_column_at(*column);
                     maybe_apply_affinity(column.ty, target_register, program);
                     Ok(target_register)
                 }
                 // If we are reading a column from a subquery, we instead copy the column from the
                 // subquery's result registers.
-                TableReferenceType::Subquery {
+                Operation::Subquery {
                     result_columns_start_reg,
                     ..
                 } => {
@@ -1538,8 +1776,8 @@ pub fn translate_expr(
             }
         }
         ast::Expr::RowId { database: _, table } => {
-            let tbl_ref = referenced_tables.as_ref().unwrap().get(*table).unwrap();
-            let cursor_id = program.resolve_cursor_id(&tbl_ref.table_identifier);
+            let table_reference = referenced_tables.as_ref().unwrap().get(*table).unwrap();
+            let cursor_id = program.resolve_cursor_id(&table_reference.identifier);
             program.emit_insn(Insn::RowId {
                 cursor_id,
                 dest: target_register,
@@ -1562,7 +1800,7 @@ pub fn translate_expr(
                 } else {
                     // must be a float
                     program.emit_insn(Insn::Real {
-                        value: val.parse().unwrap(),
+                        value: val.parse()?,
                         dest: target_register,
                     });
                 }
@@ -1635,22 +1873,33 @@ pub fn translate_expr(
                 UnaryOperator::Negative | UnaryOperator::Positive,
                 ast::Expr::Literal(ast::Literal::Numeric(numeric_value)),
             ) => {
-                let maybe_int = numeric_value.parse::<i64>();
                 let multiplier = if let UnaryOperator::Negative = op {
                     -1
                 } else {
                     1
                 };
-                if let Ok(value) = maybe_int {
+
+                // Special case: if we're negating "9223372036854775808", this is exactly MIN_INT64
+                // If we don't do this -1 * 9223372036854775808 will overflow and parse will fail and trigger conversion to Real.
+                if multiplier == -1 && numeric_value == "9223372036854775808" {
                     program.emit_insn(Insn::Integer {
-                        value: value * multiplier,
+                        value: i64::MIN,
                         dest: target_register,
                     });
                 } else {
-                    program.emit_insn(Insn::Real {
-                        value: multiplier as f64 * numeric_value.parse::<f64>()?,
-                        dest: target_register,
-                    });
+                    let maybe_int = numeric_value.parse::<i64>();
+                    if let Ok(value) = maybe_int {
+                        program.emit_insn(Insn::Integer {
+                            value: value * multiplier,
+                            dest: target_register,
+                        });
+                    } else {
+                        let value = numeric_value.parse::<f64>()?;
+                        program.emit_insn(Insn::Real {
+                            value: value * multiplier as f64,
+                            dest: target_register,
+                        });
+                    }
                 }
                 Ok(target_register)
             }
@@ -1708,9 +1957,24 @@ pub fn translate_expr(
                 });
                 Ok(target_register)
             }
-            _ => todo!(),
+            (UnaryOperator::Not, _) => {
+                let reg = program.alloc_register();
+                translate_expr(program, referenced_tables, expr, reg, resolver)?;
+                program.emit_insn(Insn::Not {
+                    reg,
+                    dest: target_register,
+                });
+                Ok(target_register)
+            }
         },
-        ast::Expr::Variable(_) => todo!(),
+        ast::Expr::Variable(name) => {
+            let index = program.parameters.push(name);
+            program.emit_insn(Insn::Variable {
+                index,
+                dest: target_register,
+            });
+            Ok(target_register)
+        }
     }
 }
 
@@ -1761,8 +2025,29 @@ fn wrap_eval_jump_expr(
     program.preassign_label_to_next_insn(if_true_label);
 }
 
+fn wrap_eval_jump_expr_zero_or_null(
+    program: &mut ProgramBuilder,
+    insn: Insn,
+    target_register: usize,
+    if_true_label: BranchOffset,
+    e1_reg: usize,
+    e2_reg: usize,
+) {
+    program.emit_insn(Insn::Integer {
+        value: 1, // emit True by default
+        dest: target_register,
+    });
+    program.emit_insn(insn);
+    program.emit_insn(Insn::ZeroOrNull {
+        rg1: e1_reg,
+        rg2: e2_reg,
+        dest: target_register,
+    });
+    program.preassign_label_to_next_insn(if_true_label);
+}
+
 pub fn maybe_apply_affinity(col_type: Type, target_register: usize, program: &mut ProgramBuilder) {
-    if col_type == crate::schema::Type::Real {
+    if col_type == Type::Real {
         program.emit_insn(Insn::RealAffinity {
             register: target_register,
         })
@@ -1802,8 +2087,8 @@ pub fn get_name(
     }
     match expr {
         ast::Expr::Column { table, column, .. } => {
-            let table_ref = referenced_tables.get(*table).unwrap();
-            table_ref.table.get_column_at(*column).name.clone()
+            let table_reference = referenced_tables.get(*table).unwrap();
+            table_reference.table.get_column_at(*column).name.clone()
         }
         _ => fallback(),
     }

@@ -1,18 +1,18 @@
 use super::emitter::emit_program;
 use super::expr::get_name;
-use super::plan::SelectQueryType;
-use crate::function::Func;
+use super::plan::{select_star, SelectQueryType};
+use crate::function::{AggFunc, ExtFunc, Func};
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{Aggregate, Direction, GroupBy, Plan, ResultSetColumn, SelectPlan};
 use crate::translate::planner::{
     bind_column_references, break_predicate_at_and_boundaries, parse_from, parse_limit,
-    parse_where, resolve_aggregates, OperatorIdCounter,
+    parse_where, resolve_aggregates,
 };
 use crate::util::normalize_ident;
 use crate::SymbolTable;
 use crate::{schema::Schema, vdbe::builder::ProgramBuilder, Result};
-use sqlite3_parser::ast;
 use sqlite3_parser::ast::ResultColumn;
+use sqlite3_parser::ast::{self};
 
 pub fn translate_select(
     program: &mut ProgramBuilder,
@@ -43,51 +43,51 @@ pub fn prepare_select_plan(
                 crate::bail_parse_error!("SELECT without columns is not allowed");
             }
 
-            let mut operator_id_counter = OperatorIdCounter::new();
+            let mut where_predicates = vec![];
 
-            // Parse the FROM clause
-            let (source, referenced_tables) =
-                parse_from(schema, from, &mut operator_id_counter, syms)?;
+            // Parse the FROM clause into a vec of TableReferences. Fold all the join conditions expressions into the WHERE clause.
+            let table_references = parse_from(schema, from, syms, &mut where_predicates)?;
 
             let mut plan = SelectPlan {
-                source,
+                table_references,
                 result_columns: vec![],
-                where_clause: None,
+                where_clause: where_predicates,
                 group_by: None,
                 order_by: None,
                 aggregates: vec![],
                 limit: None,
-                referenced_tables,
+                offset: None,
                 available_indexes: schema.indexes.clone().into_values().flatten().collect(),
                 contains_constant_false_condition: false,
                 query_type: SelectQueryType::TopLevel,
             };
 
-            // Parse the WHERE clause
-            plan.where_clause = parse_where(where_clause, &plan.referenced_tables)?;
+            // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
+            parse_where(where_clause, &plan.table_references, &mut plan.where_clause)?;
 
             let mut aggregate_expressions = Vec::new();
             for (result_column_idx, column) in columns.iter_mut().enumerate() {
                 match column {
-                    ast::ResultColumn::Star => {
-                        plan.source.select_star(&mut plan.result_columns);
+                    ResultColumn::Star => {
+                        select_star(&plan.table_references, &mut plan.result_columns);
                     }
-                    ast::ResultColumn::TableStar(name) => {
+                    ResultColumn::TableStar(name) => {
                         let name_normalized = normalize_ident(name.0.as_str());
                         let referenced_table = plan
-                            .referenced_tables
+                            .table_references
                             .iter()
-                            .find(|t| t.table_identifier == name_normalized);
+                            .enumerate()
+                            .find(|(_, t)| t.identifier == name_normalized);
 
                         if referenced_table.is_none() {
                             crate::bail_parse_error!("Table {} not found", name.0);
                         }
-                        let table_reference = referenced_table.unwrap();
-                        for (idx, col) in table_reference.columns().iter().enumerate() {
+                        let (table_index, table) = referenced_table.unwrap();
+                        for (idx, col) in table.columns().iter().enumerate() {
                             plan.result_columns.push(ResultSetColumn {
                                 expr: ast::Expr::Column {
                                     database: None, // TODO: support different databases
-                                    table: table_reference.table_index,
+                                    table: table_index,
                                     column: idx,
                                     is_rowid_alias: col.is_rowid_alias,
                                 },
@@ -96,8 +96,8 @@ pub fn prepare_select_plan(
                             });
                         }
                     }
-                    ast::ResultColumn::Expr(ref mut expr, maybe_alias) => {
-                        bind_column_references(expr, &plan.referenced_tables)?;
+                    ResultColumn::Expr(ref mut expr, maybe_alias) => {
+                        bind_column_references(expr, &plan.table_references)?;
                         match expr {
                             ast::Expr::FunctionCall {
                                 name,
@@ -116,9 +116,23 @@ pub fn prepare_select_plan(
                                     args_count,
                                 ) {
                                     Ok(Func::Agg(f)) => {
+                                        let agg_args = match (args, &f) {
+                                            (None, crate::function::AggFunc::Count0) => {
+                                                // COUNT() case
+                                                vec![ast::Expr::Literal(ast::Literal::Numeric(
+                                                    "1".to_string(),
+                                                ))]
+                                            }
+                                            (None, _) => crate::bail_parse_error!(
+                                                "Aggregate function {} requires arguments",
+                                                name.0
+                                            ),
+                                            (Some(args), _) => args.clone(),
+                                        };
+
                                         let agg = Aggregate {
                                             func: f,
-                                            args: args.as_ref().unwrap().clone(),
+                                            args: agg_args.clone(),
                                             original_expr: expr.clone(),
                                         };
                                         aggregate_expressions.push(agg.clone());
@@ -126,7 +140,7 @@ pub fn prepare_select_plan(
                                             name: get_name(
                                                 maybe_alias.as_ref(),
                                                 expr,
-                                                &plan.referenced_tables,
+                                                &plan.table_references,
                                                 || format!("expr_{}", result_column_idx),
                                             ),
                                             expr: expr.clone(),
@@ -140,29 +154,52 @@ pub fn prepare_select_plan(
                                             name: get_name(
                                                 maybe_alias.as_ref(),
                                                 expr,
-                                                &plan.referenced_tables,
+                                                &plan.table_references,
                                                 || format!("expr_{}", result_column_idx),
                                             ),
                                             expr: expr.clone(),
                                             contains_aggregates,
                                         });
                                     }
-                                    Err(_) => {
-                                        if syms.functions.contains_key(&name.0) {
-                                            let contains_aggregates = resolve_aggregates(
-                                                expr,
-                                                &mut aggregate_expressions,
-                                            );
-                                            plan.result_columns.push(ResultSetColumn {
-                                                name: get_name(
-                                                    maybe_alias.as_ref(),
+                                    Err(e) => {
+                                        if let Some(f) = syms.resolve_function(&name.0, args_count)
+                                        {
+                                            if let ExtFunc::Scalar(_) = f.as_ref().func {
+                                                let contains_aggregates = resolve_aggregates(
                                                     expr,
-                                                    &plan.referenced_tables,
-                                                    || format!("expr_{}", result_column_idx),
-                                                ),
-                                                expr: expr.clone(),
-                                                contains_aggregates,
-                                            });
+                                                    &mut aggregate_expressions,
+                                                );
+                                                plan.result_columns.push(ResultSetColumn {
+                                                    name: get_name(
+                                                        maybe_alias.as_ref(),
+                                                        expr,
+                                                        &plan.table_references,
+                                                        || format!("expr_{}", result_column_idx),
+                                                    ),
+                                                    expr: expr.clone(),
+                                                    contains_aggregates,
+                                                });
+                                            } else {
+                                                let agg = Aggregate {
+                                                    func: AggFunc::External(f.func.clone().into()),
+                                                    args: args.as_ref().unwrap().clone(),
+                                                    original_expr: expr.clone(),
+                                                };
+                                                aggregate_expressions.push(agg.clone());
+                                                plan.result_columns.push(ResultSetColumn {
+                                                    name: get_name(
+                                                        maybe_alias.as_ref(),
+                                                        expr,
+                                                        &plan.table_references,
+                                                        || format!("expr_{}", result_column_idx),
+                                                    ),
+                                                    expr: expr.clone(),
+                                                    contains_aggregates: true,
+                                                });
+                                            }
+                                            continue; // Continue with the normal flow instead of returning
+                                        } else {
+                                            return Err(e);
                                         }
                                     }
                                 }
@@ -187,7 +224,7 @@ pub fn prepare_select_plan(
                                         name: get_name(
                                             maybe_alias.as_ref(),
                                             expr,
-                                            &plan.referenced_tables,
+                                            &plan.table_references,
                                             || format!("expr_{}", result_column_idx),
                                         ),
                                         expr: expr.clone(),
@@ -207,7 +244,7 @@ pub fn prepare_select_plan(
                                     name: get_name(
                                         maybe_alias.as_ref(),
                                         expr,
-                                        &plan.referenced_tables,
+                                        &plan.table_references,
                                         || format!("expr_{}", result_column_idx),
                                     ),
                                     expr: expr.clone(),
@@ -220,7 +257,7 @@ pub fn prepare_select_plan(
             }
             if let Some(mut group_by) = group_by {
                 for expr in group_by.exprs.iter_mut() {
-                    bind_column_references(expr, &plan.referenced_tables)?;
+                    bind_column_references(expr, &plan.table_references)?;
                 }
 
                 plan.group_by = Some(GroupBy {
@@ -229,7 +266,7 @@ pub fn prepare_select_plan(
                         let mut predicates = vec![];
                         break_predicate_at_and_boundaries(having, &mut predicates);
                         for expr in predicates.iter_mut() {
-                            bind_column_references(expr, &plan.referenced_tables)?;
+                            bind_column_references(expr, &plan.table_references)?;
                             let contains_aggregates =
                                 resolve_aggregates(expr, &mut aggregate_expressions);
                             if !contains_aggregates {
@@ -275,7 +312,7 @@ pub fn prepare_select_plan(
                         o.expr
                     };
 
-                    bind_column_references(&mut expr, &plan.referenced_tables)?;
+                    bind_column_references(&mut expr, &plan.table_references)?;
                     resolve_aggregates(&expr, &mut plan.aggregates);
 
                     key.push((
@@ -289,8 +326,9 @@ pub fn prepare_select_plan(
                 plan.order_by = Some(key);
             }
 
-            // Parse the LIMIT clause
-            plan.limit = select.limit.and_then(|l| parse_limit(*l));
+            // Parse the LIMIT/OFFSET clause
+            (plan.limit, plan.offset) =
+                select.limit.map_or(Ok((None, None)), |l| parse_limit(*l))?;
 
             // Return the unoptimized query plan
             Ok(Plan::Select(plan))

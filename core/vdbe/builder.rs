@@ -1,17 +1,17 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     rc::{Rc, Weak},
 };
 
 use crate::{
+    parameters::Parameters,
     schema::{BTreeTable, Index, PseudoTable},
     storage::sqlite3_ondisk::DatabaseHeader,
     Connection,
 };
 
 use super::{BranchOffset, CursorID, Insn, InsnReference, Program};
-
 #[allow(dead_code)]
 pub struct ProgramBuilder {
     next_free_register: usize,
@@ -29,6 +29,8 @@ pub struct ProgramBuilder {
     seekrowid_emitted_bitmask: u64,
     // map of instruction index to manual comment (used in EXPLAIN)
     comments: HashMap<InsnReference, &'static str>,
+    pub parameters: Parameters,
+    pub columns: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +60,8 @@ impl ProgramBuilder {
             label_to_resolved_offset: HashMap::new(),
             seekrowid_emitted_bitmask: 0,
             comments: HashMap::new(),
+            parameters: Parameters::new(),
+            columns: Vec::new(),
         }
     }
 
@@ -81,7 +85,7 @@ impl ProgramBuilder {
         let cursor = self.next_free_cursor_id;
         self.next_free_cursor_id += 1;
         self.cursor_ref.push((table_identifier, cursor_type));
-        assert!(self.cursor_ref.len() == self.next_free_cursor_id);
+        assert_eq!(self.cursor_ref.len(), self.next_free_cursor_id);
         cursor
     }
 
@@ -92,6 +96,70 @@ impl ProgramBuilder {
             self.next_insn_label = None;
         }
         self.insns.push(insn);
+    }
+
+    pub fn emit_string8(&mut self, value: String, dest: usize) {
+        self.emit_insn(Insn::String8 { value, dest });
+    }
+
+    pub fn emit_string8_new_reg(&mut self, value: String) -> usize {
+        let dest = self.alloc_register();
+        self.emit_insn(Insn::String8 { value, dest });
+        dest
+    }
+
+    pub fn emit_int(&mut self, value: i64, dest: usize) {
+        self.emit_insn(Insn::Integer { value, dest });
+    }
+
+    pub fn emit_bool(&mut self, value: bool, dest: usize) {
+        self.emit_insn(Insn::Integer {
+            value: if value { 1 } else { 0 },
+            dest,
+        });
+    }
+
+    pub fn emit_null(&mut self, dest: usize) {
+        self.emit_insn(Insn::Null {
+            dest,
+            dest_end: None,
+        });
+    }
+
+    pub fn emit_result_row(&mut self, start_reg: usize, count: usize) {
+        self.emit_insn(Insn::ResultRow { start_reg, count });
+    }
+
+    pub fn emit_halt(&mut self) {
+        self.emit_insn(Insn::Halt {
+            err_code: 0,
+            description: String::new(),
+        });
+    }
+
+    // no users yet, but I want to avoid someone else in the future
+    // just adding parameters to emit_halt! If you use this, remove the
+    // clippy warning please.
+    #[allow(dead_code)]
+    pub fn emit_halt_err(&mut self, err_code: usize, description: String) {
+        self.emit_insn(Insn::Halt {
+            err_code,
+            description,
+        });
+    }
+
+    pub fn emit_init(&mut self) -> BranchOffset {
+        let target_pc = self.allocate_label();
+        self.emit_insn(Insn::Init { target_pc });
+        target_pc
+    }
+
+    pub fn emit_transaction(&mut self, write: bool) {
+        self.emit_insn(Insn::Transaction { write });
+    }
+
+    pub fn emit_goto(&mut self, target_pc: BranchOffset) {
+        self.emit_insn(Insn::Goto { target_pc });
     }
 
     pub fn add_comment(&mut self, insn_index: BranchOffset, comment: &'static str) {
@@ -156,6 +224,7 @@ impl ProgramBuilder {
                     lhs: _lhs,
                     rhs: _rhs,
                     target_pc,
+                    ..
                 } => {
                     resolve(target_pc, "Eq");
                 }
@@ -163,6 +232,7 @@ impl ProgramBuilder {
                     lhs: _lhs,
                     rhs: _rhs,
                     target_pc,
+                    ..
                 } => {
                     resolve(target_pc, "Ne");
                 }
@@ -170,6 +240,7 @@ impl ProgramBuilder {
                     lhs: _lhs,
                     rhs: _rhs,
                     target_pc,
+                    ..
                 } => {
                     resolve(target_pc, "Lt");
                 }
@@ -177,6 +248,7 @@ impl ProgramBuilder {
                     lhs: _lhs,
                     rhs: _rhs,
                     target_pc,
+                    ..
                 } => {
                     resolve(target_pc, "Le");
                 }
@@ -184,6 +256,7 @@ impl ProgramBuilder {
                     lhs: _lhs,
                     rhs: _rhs,
                     target_pc,
+                    ..
                 } => {
                     resolve(target_pc, "Gt");
                 }
@@ -191,20 +264,21 @@ impl ProgramBuilder {
                     lhs: _lhs,
                     rhs: _rhs,
                     target_pc,
+                    ..
                 } => {
                     resolve(target_pc, "Ge");
                 }
                 Insn::If {
                     reg: _reg,
                     target_pc,
-                    null_reg: _,
+                    jump_if_null: _,
                 } => {
                     resolve(target_pc, "If");
                 }
                 Insn::IfNot {
                     reg: _reg,
                     target_pc,
-                    null_reg: _,
+                    jump_if_null: _,
                 } => {
                     resolve(target_pc, "IfNot");
                 }
@@ -300,7 +374,7 @@ impl ProgramBuilder {
                 Insn::IdxGT { target_pc, .. } => {
                     resolve(target_pc, "IdxGT");
                 }
-                Insn::IsNull { src: _, target_pc } => {
+                Insn::IsNull { reg: _, target_pc } => {
                     resolve(target_pc, "IsNull");
                 }
                 _ => continue,
@@ -325,12 +399,14 @@ impl ProgramBuilder {
         mut self,
         database_header: Rc<RefCell<DatabaseHeader>>,
         connection: Weak<Connection>,
+        change_cnt_on: bool,
     ) -> Program {
         self.resolve_labels();
         assert!(
             self.constant_insns.is_empty(),
             "constant_insns is not empty when build() is called, did you forget to call emit_constant_insns()?"
         );
+        self.parameters.list.dedup();
         Program {
             max_registers: self.next_free_register,
             insns: self.insns,
@@ -339,6 +415,10 @@ impl ProgramBuilder {
             comments: self.comments,
             connection,
             auto_commit: true,
+            parameters: self.parameters,
+            n_change: Cell::new(0),
+            change_cnt_on,
+            columns: self.columns,
         }
     }
 }

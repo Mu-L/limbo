@@ -1,9 +1,11 @@
 mod error;
 mod ext;
 mod function;
+mod info;
 mod io;
 #[cfg(feature = "json")]
 mod json;
+mod parameters;
 mod pseudo;
 mod result;
 mod schema;
@@ -20,14 +22,14 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use fallible_iterator::FallibleIterator;
 #[cfg(not(target_family = "wasm"))]
 use libloading::{Library, Symbol};
-#[cfg(not(target_family = "wasm"))]
-use limbo_extension::{ExtensionApi, ExtensionEntryPoint, RESULT_OK};
+use limbo_ext::{ExtensionApi, ExtensionEntryPoint};
 use log::trace;
 use schema::Schema;
 use sqlite3_parser::ast;
 use sqlite3_parser::{ast::Cmd, lexer::sql::Parser};
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::num::NonZero;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::{cell::RefCell, rc::Rc};
 use storage::btree::btree_init_page;
@@ -43,7 +45,7 @@ use util::parse_schema_rows;
 
 pub use error::LimboError;
 use translate::select::prepare_select_plan;
-pub type Result<T> = std::result::Result<T, error::LimboError>;
+pub type Result<T, E = LimboError> = std::result::Result<T, E>;
 
 use crate::translate::optimizer::optimize_plan;
 pub use io::OpenFlags;
@@ -84,7 +86,7 @@ impl Database {
     pub fn open_file(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
         use storage::wal::WalFileShared;
 
-        let file = io.open_file(path, io::OpenFlags::Create, true)?;
+        let file = io.open_file(path, OpenFlags::Create, true)?;
         maybe_init_database_file(&file, &io)?;
         let page_io = Rc::new(FileStorage::new(file));
         let wal_path = format!("{}-wal", path);
@@ -136,6 +138,9 @@ impl Database {
             _shared_wal: shared_wal.clone(),
             syms,
         };
+        if let Err(e) = db.register_builtins() {
+            return Err(LimboError::ExtensionError(e));
+        }
         let db = Arc::new(db);
         let conn = Rc::new(Connection {
             db: db.clone(),
@@ -166,24 +171,9 @@ impl Database {
         })
     }
 
-    pub fn define_scalar_function<S: AsRef<str>>(
-        &self,
-        name: S,
-        func: limbo_extension::ScalarFunction,
-    ) {
-        let func = function::ExternalFunc {
-            name: name.as_ref().to_string(),
-            func,
-        };
-        self.syms
-            .borrow_mut()
-            .functions
-            .insert(name.as_ref().to_string(), func.into());
-    }
-
     #[cfg(not(target_family = "wasm"))]
     pub fn load_extension<P: AsRef<std::ffi::OsStr>>(&self, path: P) -> Result<()> {
-        let api = Box::new(self.build_limbo_extension());
+        let api = Box::new(self.build_limbo_ext());
         let lib =
             unsafe { Library::new(path).map_err(|e| LimboError::ExtensionError(e.to_string()))? };
         let entry: Symbol<ExtensionEntryPoint> = unsafe {
@@ -191,8 +181,8 @@ impl Database {
                 .map_err(|e| LimboError::ExtensionError(e.to_string()))?
         };
         let api_ptr: *const ExtensionApi = Box::into_raw(api);
-        let result_code = entry(api_ptr);
-        if result_code == RESULT_OK {
+        let result_code = unsafe { entry(api_ptr) };
+        if result_code.is_ok() {
             self.syms.borrow_mut().extensions.push((lib, api_ptr));
             Ok(())
         } else {
@@ -207,7 +197,7 @@ impl Database {
 }
 
 pub fn maybe_init_database_file(file: &Rc<dyn File>, io: &Arc<dyn IO>) -> Result<()> {
-    if file.size().unwrap() == 0 {
+    if file.size()? == 0 {
         // init db
         let db_header = DatabaseHeader::default();
         let page1 = allocate_page(
@@ -236,8 +226,7 @@ pub fn maybe_init_database_file(file: &Rc<dyn File>, io: &Arc<dyn IO>) -> Result
                 let completion = Completion::Write(WriteCompletion::new(Box::new(move |_| {
                     *flag_complete.borrow_mut() = true;
                 })));
-                file.pwrite(0, contents.buffer.clone(), Rc::new(completion))
-                    .unwrap();
+                file.pwrite(0, contents.buffer.clone(), Rc::new(completion))?;
             }
             let mut limit = 100;
             loop {
@@ -267,10 +256,10 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub fn prepare(self: &Rc<Connection>, sql: impl Into<String>) -> Result<Statement> {
-        let sql = sql.into();
+    pub fn prepare(self: &Rc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
+        let sql = sql.as_ref();
         trace!("Preparing: {}", sql);
-        let db = self.db.clone();
+        let db = &self.db;
         let syms: &SymbolTable = &db.syms.borrow();
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next()?;
@@ -295,8 +284,8 @@ impl Connection {
         }
     }
 
-    pub fn query(self: &Rc<Connection>, sql: impl Into<String>) -> Result<Option<Rows>> {
-        let sql = sql.into();
+    pub fn query(self: &Rc<Connection>, sql: impl AsRef<str>) -> Result<Option<Statement>> {
+        let sql = sql.as_ref();
         trace!("Querying: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next()?;
@@ -306,10 +295,9 @@ impl Connection {
         }
     }
 
-    pub(crate) fn run_cmd(self: &Rc<Connection>, cmd: Cmd) -> Result<Option<Rows>> {
+    pub(crate) fn run_cmd(self: &Rc<Connection>, cmd: Cmd) -> Result<Option<Statement>> {
         let db = self.db.clone();
         let syms: &SymbolTable = &db.syms.borrow();
-
         match cmd {
             Cmd::Stmt(stmt) => {
                 let program = Rc::new(translate::translate(
@@ -321,7 +309,7 @@ impl Connection {
                     syms,
                 )?);
                 let stmt = Statement::new(program, self.pager.clone());
-                Ok(Some(Rows { stmt }))
+                Ok(Some(stmt))
             }
             Cmd::Explain(stmt) => {
                 let program = translate::translate(
@@ -357,9 +345,9 @@ impl Connection {
         QueryRunner::new(self, sql)
     }
 
-    pub fn execute(self: &Rc<Connection>, sql: impl Into<String>) -> Result<()> {
-        let sql = sql.into();
-        let db = self.db.clone();
+    pub fn execute(self: &Rc<Connection>, sql: impl AsRef<str>) -> Result<()> {
+        let sql = sql.as_ref();
+        let db = &self.db;
         let syms: &SymbolTable = &db.syms.borrow();
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next()?;
@@ -386,7 +374,9 @@ impl Connection {
                         Rc::downgrade(self),
                         syms,
                     )?;
-                    let mut state = vdbe::ProgramState::new(program.max_registers);
+
+                    let mut state =
+                        vdbe::ProgramState::new(program.max_registers, program.cursor_ref.len());
                     program.step(&mut state, self.pager.clone())?;
                 }
             }
@@ -435,6 +425,16 @@ impl Connection {
     fn update_last_rowid(&self, rowid: u64) {
         self.last_insert_rowid.set(rowid);
     }
+
+    pub fn set_changes(&self, nchange: i64) {
+        self.last_change.set(nchange);
+        let prev_total_changes = self.total_changes.get();
+        self.total_changes.set(prev_total_changes + nchange);
+    }
+
+    pub fn total_changes(&self) -> i64 {
+        self.total_changes.get()
+    }
 }
 
 pub struct Statement {
@@ -445,7 +445,7 @@ pub struct Statement {
 
 impl Statement {
     pub fn new(program: Rc<vdbe::Program>, pager: Rc<Pager>) -> Self {
-        let state = vdbe::ProgramState::new(program.max_registers);
+        let state = vdbe::ProgramState::new(program.max_registers, program.cursor_ref.len());
         Self {
             program,
             state,
@@ -468,14 +468,33 @@ impl Statement {
         }
     }
 
-    pub fn query(&mut self) -> Result<Rows> {
+    pub fn query(&mut self) -> Result<Statement> {
         let stmt = Statement::new(self.program.clone(), self.pager.clone());
-        Ok(Rows::new(stmt))
+        Ok(stmt)
     }
 
-    pub fn reset(&self) {}
+    pub fn columns(&self) -> &[String] {
+        &self.program.columns
+    }
+
+    pub fn parameters(&self) -> &parameters::Parameters {
+        &self.program.parameters
+    }
+
+    pub fn parameters_count(&self) -> usize {
+        self.program.parameters.count()
+    }
+
+    pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) {
+        self.state.bind_at(index, value.into());
+    }
+
+    pub fn reset(&mut self) {
+        self.state.reset();
+    }
 }
 
+#[derive(Debug, PartialEq)]
 pub enum StepResult<'a> {
     Row(Row<'a>),
     IO,
@@ -484,35 +503,22 @@ pub enum StepResult<'a> {
     Busy,
 }
 
+#[derive(Debug, PartialEq)]
 pub struct Row<'a> {
     pub values: Vec<Value<'a>>,
 }
 
 impl<'a> Row<'a> {
-    pub fn get<T: crate::types::FromValue<'a> + 'a>(&self, idx: usize) -> Result<T> {
+    pub fn get<T: types::FromValue<'a> + 'a>(&self, idx: usize) -> Result<T> {
         let value = &self.values[idx];
         T::from_value(value)
     }
 }
 
-pub struct Rows {
-    stmt: Statement,
-}
-
-impl Rows {
-    pub fn new(stmt: Statement) -> Self {
-        Self { stmt }
-    }
-
-    pub fn next_row(&mut self) -> Result<StepResult<'_>> {
-        self.stmt.step()
-    }
-}
-
 pub(crate) struct SymbolTable {
-    pub functions: HashMap<String, Rc<crate::function::ExternalFunc>>,
+    pub functions: HashMap<String, Rc<function::ExternalFunc>>,
     #[cfg(not(target_family = "wasm"))]
-    extensions: Vec<(libloading::Library, *const ExtensionApi)>,
+    extensions: Vec<(Library, *const ExtensionApi)>,
 }
 
 impl std::fmt::Debug for SymbolTable {
@@ -554,7 +560,6 @@ impl SymbolTable {
     pub fn new() -> Self {
         Self {
             functions: HashMap::new(),
-            // TODO: wasm libs will be very different
             #[cfg(not(target_family = "wasm"))]
             extensions: Vec::new(),
         }
@@ -564,7 +569,7 @@ impl SymbolTable {
         &self,
         name: &str,
         _arg_count: usize,
-    ) -> Option<Rc<crate::function::ExternalFunc>> {
+    ) -> Option<Rc<function::ExternalFunc>> {
         self.functions.get(name).cloned()
     }
 }
@@ -584,13 +589,16 @@ impl<'a> QueryRunner<'a> {
 }
 
 impl Iterator for QueryRunner<'_> {
-    type Item = Result<Option<Rows>>;
+    type Item = Result<Option<Statement>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.parser.next() {
             Ok(Some(cmd)) => Some(self.conn.run_cmd(cmd)),
             Ok(None) => None,
-            Err(err) => Some(Result::Err(LimboError::from(err))),
+            Err(err) => {
+                self.parser.finalize();
+                Some(Result::Err(LimboError::from(err)))
+            }
         }
     }
 }

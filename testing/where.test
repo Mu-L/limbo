@@ -3,6 +3,53 @@
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 
+do_execsql_test_small where-is-null {
+    select count(*) from demo where value is null;
+} {2}
+
+do_execsql_test_small where-equals-null {
+    select count(*) from demo where value = null;
+} {0}
+
+do_execsql_test_small where-is-not-null {
+    select count(*) from demo where value is not null;
+} {3}
+
+do_execsql_test_small where-not-equal-null {
+    select count(*) from demo where value != null;
+} {0}
+
+do_execsql_test_small where-is-a-with-nulls {
+    select count(*) from demo where value is 'A';
+} {1}
+
+do_execsql_test_small where-equals-a-with-nulls {
+    select count(*) from demo where value == 'A';
+} {1}
+
+do_execsql_test_small where-is-not-a-with-nulls {
+    select count(*) from demo where value is not 'A';
+} {4}
+
+do_execsql_test_small where-not-equals-a-with-nulls {
+    select count(*) from demo where value != 'A';
+} {2}
+
+do_execsql_test_small where-is-null-combined {
+    select * from demo where value is null or id = 3;
+} {2|
+3|B
+4|
+}
+
+do_execsql_test_small where-is-not-null-combined {
+    select * from demo where value is not null or id = 2;
+} {1|A
+2|
+3|B
+5|C
+}
+
 do_execsql_test where-clause-eq {
     select last_name from users where id = 2000;
 } {Rodriguez}
@@ -10,6 +57,14 @@ do_execsql_test where-clause-eq {
 do_execsql_test where-clause-eq-string {
     select count(1) from users where last_name = 'Rodriguez';
 } {61}
+
+do_execsql_test where-clause-isnull {
+    select count(1) from users where last_name isnull;
+} {0}
+
+do_execsql_test where-clause-notnull {
+    select count(1) from users where last_name not null;
+} {10000}
 
 do_execsql_test where-clause-ne {
     select count(1) from users where id != 2000;
@@ -383,3 +438,27 @@ do_execsql_test nested-parens-and-inside-or-regression-test {
         (id = 6 OR FALSE)
     );
 } {1}
+
+# Regression tests for binary conditional jump comparisons where one operand is null
+# Test behavior of binary comparisons (=,>,<,>=,<=,!=) when one operand is NULL
+# Each test has 3 variants:
+# 1. Simple comparison with NULL (should return empty)
+# 2. Comparison with NULL OR id=1 (should return Jamie)
+# 3. Comparison with NULL AND id=1 (should return empty)
+foreach {operator} {
+    =
+    >  
+    <
+    >=
+    <=
+    !=
+} {
+    # Simple NULL comparison
+    do_execsql_test where-binary-one-operand-null-$operator "select * from users where first_name $operator NULL" {}
+
+    # NULL comparison OR id=1 
+    do_execsql_test where-binary-one-operand-null-or-$operator "select first_name from users where first_name $operator NULL OR id = 1" {Jamie}
+
+    # NULL comparison AND id=1
+    do_execsql_test where-binary-one-operand-null-and-$operator "select first_name from users where first_name $operator NULL AND id = 1" {}
+}

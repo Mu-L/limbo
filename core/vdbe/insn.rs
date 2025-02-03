@@ -1,6 +1,41 @@
+use std::num::NonZero;
+use std::rc::Rc;
+
 use super::{AggFunc, BranchOffset, CursorID, FuncCtx, PageIdx};
+use crate::storage::wal::CheckpointMode;
 use crate::types::{OwnedRecord, OwnedValue};
 use limbo_macros::Description;
+
+/// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CmpInsFlags(usize);
+
+impl CmpInsFlags {
+    const NULL_EQ: usize = 0x80;
+    const JUMP_IF_NULL: usize = 0x10;
+
+    fn has(&self, flag: usize) -> bool {
+        (self.0 & flag) != 0
+    }
+
+    pub fn null_eq(mut self) -> Self {
+        self.0 |= CmpInsFlags::NULL_EQ;
+        self
+    }
+
+    pub fn jump_if_null(mut self) -> Self {
+        self.0 |= CmpInsFlags::JUMP_IF_NULL;
+        self
+    }
+
+    pub fn has_jump_if_null(&self) -> bool {
+        self.has(CmpInsFlags::JUMP_IF_NULL)
+    }
+
+    pub fn has_nulleq(&self) -> bool {
+        self.has(CmpInsFlags::NULL_EQ)
+    }
+}
 
 #[derive(Description, Debug)]
 pub enum Insn {
@@ -64,6 +99,12 @@ pub enum Insn {
         reg: usize,
         dest: usize,
     },
+    // Checkpoint the database (applying wal file content to database file).
+    Checkpoint {
+        database: usize,                 // checkpoint database P1
+        checkpoint_mode: CheckpointMode, // P2 checkpoint mode
+        dest: usize,                     // P3 checkpoint result
+    },
     // Divide lhs by rhs and place the remainder in dest register.
     Remainder {
         lhs: usize,
@@ -98,50 +139,70 @@ pub enum Insn {
         lhs: usize,
         rhs: usize,
         target_pc: BranchOffset,
+        /// CmpInsFlags are nulleq (null = null) or jump_if_null.
+        ///
+        /// jump_if_null jumps if either of the operands is null. Used for "jump when false" logic.
+        /// Eg. "SELECT * FROM users WHERE id = NULL" becomes:
+        /// <JUMP TO NEXT ROW IF id != NULL>
+        /// Without the jump_if_null flag it would not jump because the logical comparison "id != NULL" is never true.
+        /// This flag indicates that if either is null we should still jump.
+        flags: CmpInsFlags,
     },
     // Compare two registers and jump to the given PC if they are not equal.
     Ne {
         lhs: usize,
         rhs: usize,
         target_pc: BranchOffset,
+        /// CmpInsFlags are nulleq (null = null) or jump_if_null.
+        ///
+        /// jump_if_null jumps if either of the operands is null. Used for "jump when false" logic.
+        flags: CmpInsFlags,
     },
     // Compare two registers and jump to the given PC if the left-hand side is less than the right-hand side.
     Lt {
         lhs: usize,
         rhs: usize,
         target_pc: BranchOffset,
+        /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
+        flags: CmpInsFlags,
     },
     // Compare two registers and jump to the given PC if the left-hand side is less than or equal to the right-hand side.
     Le {
         lhs: usize,
         rhs: usize,
         target_pc: BranchOffset,
+        /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
+        flags: CmpInsFlags,
     },
     // Compare two registers and jump to the given PC if the left-hand side is greater than the right-hand side.
     Gt {
         lhs: usize,
         rhs: usize,
         target_pc: BranchOffset,
+        /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
+        flags: CmpInsFlags,
     },
     // Compare two registers and jump to the given PC if the left-hand side is greater than or equal to the right-hand side.
     Ge {
         lhs: usize,
         rhs: usize,
         target_pc: BranchOffset,
+        /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
+        flags: CmpInsFlags,
     },
-    /// Jump to target_pc if r\[reg\] != 0 or (r\[reg\] == NULL && r\[null_reg\] != 0)
+    /// Jump to target_pc if r\[reg\] != 0 or (r\[reg\] == NULL && r\[jump_if_null\] != 0)
     If {
         reg: usize,              // P1
         target_pc: BranchOffset, // P2
-        /// P3. If r\[reg\] is null, jump iff r\[null_reg\] != 0
-        null_reg: usize,
+        /// P3. If r\[reg\] is null, jump iff r\[jump_if_null\] != 0
+        jump_if_null: bool,
     },
-    /// Jump to target_pc if r\[reg\] != 0 or (r\[reg\] == NULL && r\[null_reg\] != 0)
+    /// Jump to target_pc if r\[reg\] != 0 or (r\[reg\] == NULL && r\[jump_if_null\] != 0)
     IfNot {
         reg: usize,              // P1
         target_pc: BranchOffset, // P2
-        /// P3. If r\[reg\] is null, jump iff r\[null_reg\] != 0
-        null_reg: usize,
+        /// P3. If r\[reg\] is null, jump iff r\[jump_if_null\] != 0
+        jump_if_null: bool,
     },
     // Open a cursor for reading.
     OpenReadAsync {
@@ -447,6 +508,12 @@ pub enum Insn {
         target_pc: BranchOffset,
     },
 
+    OffsetLimit {
+        limit_reg: usize,
+        combined_reg: usize,
+        offset_reg: usize,
+    },
+
     OpenWriteAsync {
         cursor_id: CursorID,
         root_page: PageIdx,
@@ -478,7 +545,7 @@ pub enum Insn {
     /// Check if the register is null.
     IsNull {
         /// Source register (P1).
-        src: usize,
+        reg: usize,
 
         /// Jump to this PC if the register is null (P2).
         target_pc: BranchOffset,
@@ -487,16 +554,60 @@ pub enum Insn {
         db: usize,
         where_clause: String,
     },
+
     // Place the result of lhs >> rhs in dest register.
     ShiftRight {
         lhs: usize,
         rhs: usize,
         dest: usize,
     },
+
     // Place the result of lhs << rhs in dest register.
     ShiftLeft {
         lhs: usize,
         rhs: usize,
+        dest: usize,
+    },
+
+    /// Get parameter variable.
+    Variable {
+        index: NonZero<usize>,
+        dest: usize,
+    },
+    /// If either register is null put null else put 0
+    ZeroOrNull {
+        /// Source register (P1).
+        rg1: usize,
+        rg2: usize,
+        dest: usize,
+    },
+    /// Interpret the value in reg as boolean and store its compliment in destination
+    Not {
+        reg: usize,
+        dest: usize,
+    },
+    /// Concatenates the `rhs` and `lhs` values and stores the result in the third register.
+    Concat {
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
+    /// Take the logical AND of the values in registers P1 and P2 and write the result into register P3.
+    And {
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
+    /// Take the logical OR of the values in register P1 and P2 and store the answer in register P3.
+    Or {
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
+    Noop,
+    /// Write the current number of pages in database P1 to memory cell P2.
+    PageCount {
+        db: usize,
         dest: usize,
     },
 }
@@ -769,16 +880,7 @@ pub fn exec_shift_left(mut lhs: &OwnedValue, mut rhs: &OwnedValue) -> OwnedValue
 }
 
 fn compute_shl(lhs: i64, rhs: i64) -> i64 {
-    if rhs == 0 {
-        lhs
-    } else if rhs >= 64 || rhs <= -64 {
-        0
-    } else if rhs < 0 {
-        // if negative do right shift
-        lhs >> (-rhs)
-    } else {
-        lhs << rhs
-    }
+    compute_shr(lhs, -rhs)
 }
 
 pub fn exec_shift_right(mut lhs: &OwnedValue, mut rhs: &OwnedValue) -> OwnedValue {
@@ -816,15 +918,258 @@ pub fn exec_shift_right(mut lhs: &OwnedValue, mut rhs: &OwnedValue) -> OwnedValu
     }
 }
 
+// compute binary shift to the right if rhs >= 0 and binary shift to the left - if rhs < 0
+// note, that binary shift to the right is sign-extended
 fn compute_shr(lhs: i64, rhs: i64) -> i64 {
     if rhs == 0 {
         lhs
-    } else if rhs >= 64 || rhs <= -64 {
+    } else if rhs >= 64 && lhs >= 0 || rhs <= -64 {
         0
+    } else if rhs >= 64 && lhs < 0 {
+        -1
     } else if rhs < 0 {
         // if negative do left shift
         lhs << (-rhs)
     } else {
         lhs >> rhs
+    }
+}
+
+pub fn exec_boolean_not(mut reg: &OwnedValue) -> OwnedValue {
+    if let OwnedValue::Agg(agg) = reg {
+        reg = agg.final_value();
+    }
+    match reg {
+        OwnedValue::Null => OwnedValue::Null,
+        OwnedValue::Integer(i) => OwnedValue::Integer((*i == 0) as i64),
+        OwnedValue::Float(f) => OwnedValue::Integer((*f == 0.0) as i64),
+        OwnedValue::Text(text) => exec_boolean_not(&cast_text_to_numerical(&text.value)),
+        _ => todo!(),
+    }
+}
+
+pub fn exec_concat(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
+    match (lhs, rhs) {
+        (OwnedValue::Text(lhs_text), OwnedValue::Text(rhs_text)) => {
+            OwnedValue::build_text(Rc::new(lhs_text.value.as_ref().clone() + &rhs_text.value))
+        }
+        (OwnedValue::Text(lhs_text), OwnedValue::Integer(rhs_int)) => OwnedValue::build_text(
+            Rc::new(lhs_text.value.as_ref().clone() + &rhs_int.to_string()),
+        ),
+        (OwnedValue::Text(lhs_text), OwnedValue::Float(rhs_float)) => OwnedValue::build_text(
+            Rc::new(lhs_text.value.as_ref().clone() + &rhs_float.to_string()),
+        ),
+        (OwnedValue::Text(lhs_text), OwnedValue::Agg(rhs_agg)) => OwnedValue::build_text(Rc::new(
+            lhs_text.value.as_ref().clone() + &rhs_agg.final_value().to_string(),
+        )),
+
+        (OwnedValue::Integer(lhs_int), OwnedValue::Text(rhs_text)) => {
+            OwnedValue::build_text(Rc::new(lhs_int.to_string() + &rhs_text.value))
+        }
+        (OwnedValue::Integer(lhs_int), OwnedValue::Integer(rhs_int)) => {
+            OwnedValue::build_text(Rc::new(lhs_int.to_string() + &rhs_int.to_string()))
+        }
+        (OwnedValue::Integer(lhs_int), OwnedValue::Float(rhs_float)) => {
+            OwnedValue::build_text(Rc::new(lhs_int.to_string() + &rhs_float.to_string()))
+        }
+        (OwnedValue::Integer(lhs_int), OwnedValue::Agg(rhs_agg)) => OwnedValue::build_text(
+            Rc::new(lhs_int.to_string() + &rhs_agg.final_value().to_string()),
+        ),
+
+        (OwnedValue::Float(lhs_float), OwnedValue::Text(rhs_text)) => {
+            OwnedValue::build_text(Rc::new(lhs_float.to_string() + &rhs_text.value))
+        }
+        (OwnedValue::Float(lhs_float), OwnedValue::Integer(rhs_int)) => {
+            OwnedValue::build_text(Rc::new(lhs_float.to_string() + &rhs_int.to_string()))
+        }
+        (OwnedValue::Float(lhs_float), OwnedValue::Float(rhs_float)) => {
+            OwnedValue::build_text(Rc::new(lhs_float.to_string() + &rhs_float.to_string()))
+        }
+        (OwnedValue::Float(lhs_float), OwnedValue::Agg(rhs_agg)) => OwnedValue::build_text(
+            Rc::new(lhs_float.to_string() + &rhs_agg.final_value().to_string()),
+        ),
+
+        (OwnedValue::Agg(lhs_agg), OwnedValue::Text(rhs_text)) => {
+            OwnedValue::build_text(Rc::new(lhs_agg.final_value().to_string() + &rhs_text.value))
+        }
+        (OwnedValue::Agg(lhs_agg), OwnedValue::Integer(rhs_int)) => OwnedValue::build_text(
+            Rc::new(lhs_agg.final_value().to_string() + &rhs_int.to_string()),
+        ),
+        (OwnedValue::Agg(lhs_agg), OwnedValue::Float(rhs_float)) => OwnedValue::build_text(
+            Rc::new(lhs_agg.final_value().to_string() + &rhs_float.to_string()),
+        ),
+        (OwnedValue::Agg(lhs_agg), OwnedValue::Agg(rhs_agg)) => OwnedValue::build_text(Rc::new(
+            lhs_agg.final_value().to_string() + &rhs_agg.final_value().to_string(),
+        )),
+
+        (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
+        (OwnedValue::Blob(_), _) | (_, OwnedValue::Blob(_)) => {
+            todo!("TODO: Handle Blob conversion to String")
+        }
+        (OwnedValue::Record(_), _) | (_, OwnedValue::Record(_)) => unreachable!(),
+    }
+}
+
+pub fn exec_and(mut lhs: &OwnedValue, mut rhs: &OwnedValue) -> OwnedValue {
+    if let OwnedValue::Agg(agg) = lhs {
+        lhs = agg.final_value();
+    }
+    if let OwnedValue::Agg(agg) = rhs {
+        rhs = agg.final_value();
+    }
+
+    match (lhs, rhs) {
+        (_, OwnedValue::Integer(0))
+        | (OwnedValue::Integer(0), _)
+        | (_, OwnedValue::Float(0.0))
+        | (OwnedValue::Float(0.0), _) => OwnedValue::Integer(0),
+        (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
+        (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_and(
+            &cast_text_to_numerical(&lhs.value),
+            &cast_text_to_numerical(&rhs.value),
+        ),
+        (OwnedValue::Text(text), other) | (other, OwnedValue::Text(text)) => {
+            exec_and(&cast_text_to_numerical(&text.value), other)
+        }
+        _ => OwnedValue::Integer(1),
+    }
+}
+
+pub fn exec_or(mut lhs: &OwnedValue, mut rhs: &OwnedValue) -> OwnedValue {
+    if let OwnedValue::Agg(agg) = lhs {
+        lhs = agg.final_value();
+    }
+    if let OwnedValue::Agg(agg) = rhs {
+        rhs = agg.final_value();
+    }
+
+    match (lhs, rhs) {
+        (OwnedValue::Null, OwnedValue::Null)
+        | (OwnedValue::Null, OwnedValue::Float(0.0))
+        | (OwnedValue::Float(0.0), OwnedValue::Null)
+        | (OwnedValue::Null, OwnedValue::Integer(0))
+        | (OwnedValue::Integer(0), OwnedValue::Null) => OwnedValue::Null,
+        (OwnedValue::Float(0.0), OwnedValue::Integer(0))
+        | (OwnedValue::Integer(0), OwnedValue::Float(0.0))
+        | (OwnedValue::Float(0.0), OwnedValue::Float(0.0))
+        | (OwnedValue::Integer(0), OwnedValue::Integer(0)) => OwnedValue::Integer(0),
+        (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_or(
+            &cast_text_to_numerical(&lhs.value),
+            &cast_text_to_numerical(&rhs.value),
+        ),
+        (OwnedValue::Text(text), other) | (other, OwnedValue::Text(text)) => {
+            exec_or(&cast_text_to_numerical(&text.value), other)
+        }
+        _ => OwnedValue::Integer(1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use crate::{
+        types::{LimboText, OwnedValue},
+        vdbe::insn::exec_or,
+    };
+
+    use super::exec_and;
+
+    #[test]
+    fn test_exec_and() {
+        let inputs = vec![
+            (OwnedValue::Integer(0), OwnedValue::Null),
+            (OwnedValue::Null, OwnedValue::Integer(1)),
+            (OwnedValue::Null, OwnedValue::Null),
+            (OwnedValue::Float(0.0), OwnedValue::Null),
+            (OwnedValue::Integer(1), OwnedValue::Float(2.2)),
+            (
+                OwnedValue::Integer(0),
+                OwnedValue::Text(LimboText::new(Rc::new("string".to_string()))),
+            ),
+            (
+                OwnedValue::Integer(0),
+                OwnedValue::Text(LimboText::new(Rc::new("1".to_string()))),
+            ),
+            (
+                OwnedValue::Integer(1),
+                OwnedValue::Text(LimboText::new(Rc::new("1".to_string()))),
+            ),
+        ];
+        let outpus = [
+            OwnedValue::Integer(0),
+            OwnedValue::Null,
+            OwnedValue::Null,
+            OwnedValue::Integer(0),
+            OwnedValue::Integer(1),
+            OwnedValue::Integer(0),
+            OwnedValue::Integer(0),
+            OwnedValue::Integer(1),
+        ];
+
+        assert_eq!(
+            inputs.len(),
+            outpus.len(),
+            "Inputs and Outputs should have same size"
+        );
+        for (i, (lhs, rhs)) in inputs.iter().enumerate() {
+            assert_eq!(
+                exec_and(lhs, rhs),
+                outpus[i],
+                "Wrong AND for lhs: {}, rhs: {}",
+                lhs,
+                rhs
+            );
+        }
+    }
+
+    #[test]
+    fn test_exec_or() {
+        let inputs = vec![
+            (OwnedValue::Integer(0), OwnedValue::Null),
+            (OwnedValue::Null, OwnedValue::Integer(1)),
+            (OwnedValue::Null, OwnedValue::Null),
+            (OwnedValue::Float(0.0), OwnedValue::Null),
+            (OwnedValue::Integer(1), OwnedValue::Float(2.2)),
+            (OwnedValue::Float(0.0), OwnedValue::Integer(0)),
+            (
+                OwnedValue::Integer(0),
+                OwnedValue::Text(LimboText::new(Rc::new("string".to_string()))),
+            ),
+            (
+                OwnedValue::Integer(0),
+                OwnedValue::Text(LimboText::new(Rc::new("1".to_string()))),
+            ),
+            (
+                OwnedValue::Integer(0),
+                OwnedValue::Text(LimboText::new(Rc::new("".to_string()))),
+            ),
+        ];
+        let outpus = [
+            OwnedValue::Null,
+            OwnedValue::Integer(1),
+            OwnedValue::Null,
+            OwnedValue::Null,
+            OwnedValue::Integer(1),
+            OwnedValue::Integer(0),
+            OwnedValue::Integer(0),
+            OwnedValue::Integer(1),
+            OwnedValue::Integer(0),
+        ];
+
+        assert_eq!(
+            inputs.len(),
+            outpus.len(),
+            "Inputs and Outputs should have same size"
+        );
+        for (i, (lhs, rhs)) in inputs.iter().enumerate() {
+            assert_eq!(
+                exec_or(lhs, rhs),
+                outpus[i],
+                "Wrong OR for lhs: {}, rhs: {}",
+                lhs,
+                rhs
+            );
+        }
     }
 }

@@ -1,161 +1,232 @@
 package org.github.tursodatabase.core;
 
+import static org.github.tursodatabase.utils.ByteArrayUtils.stringToUtf8ByteArray;
 
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.sql.SQLException;
+import java.util.concurrent.locks.ReentrantLock;
 import org.github.tursodatabase.LimboErrorCode;
 import org.github.tursodatabase.annotations.NativeInvocation;
 import org.github.tursodatabase.annotations.VisibleForTesting;
-import org.github.tursodatabase.annotations.Nullable;
-import org.github.tursodatabase.exceptions.LimboException;
+import org.github.tursodatabase.utils.LimboExceptionUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.nio.charset.StandardCharsets;
-import java.sql.SQLException;
-import java.sql.SQLFeatureNotSupportedException;
-
-/**
- * This class provides a thin JNI layer over the SQLite3 C API.
- */
+/** This class provides a thin JNI layer over the SQLite3 C API. */
 public final class LimboDB extends AbstractDB {
+  private static final Logger logger = LoggerFactory.getLogger(LimboDB.class);
+  // Pointer to database instance
+  private long dbPointer;
+  private boolean isOpen;
 
-    // Pointer to database instance
-    private long dbPtr;
-    private boolean isOpen;
+  private static boolean isLoaded;
+  private ReentrantLock dbLock = new ReentrantLock();
 
-    private static boolean isLoaded;
+  static {
+    if ("The Android Project".equals(System.getProperty("java.vm.vendor"))) {
+      // TODO
+    } else {
+      // continue with non Android execution path
+      isLoaded = false;
+    }
+  }
 
-    static {
-        if ("The Android Project".equals(System.getProperty("java.vm.vendor"))) {
-            // TODO
-        } else {
-            // continue with non Android execution path
-            isLoaded = false;
+  /**
+   * Enum representing different architectures and their corresponding library paths and file
+   * extensions.
+   */
+  enum Architecture {
+    MACOS_ARM64("libs/macos_arm64/lib_limbo_java.dylib", ".dylib"),
+    MACOS_X86("libs/macos_x86/lib_limbo_java.dylib", ".dylib"),
+    WINDOWS("libs/windows/lib_limbo_java.dll", ".dll"),
+    UNSUPPORTED("", "");
+
+    private final String libPath;
+    private final String fileExtension;
+
+    Architecture(String libPath, String fileExtension) {
+      this.libPath = libPath;
+      this.fileExtension = fileExtension;
+    }
+
+    public String getLibPath() {
+      return libPath;
+    }
+
+    public String getFileExtension() {
+      return fileExtension;
+    }
+
+    public static Architecture detect() {
+      String osName = System.getProperty("os.name").toLowerCase();
+      String osArch = System.getProperty("os.arch").toLowerCase();
+
+      if (osName.contains("mac")) {
+        if (osArch.contains("aarch64") || osArch.contains("arm64")) {
+          return MACOS_ARM64;
+        } else if (osArch.contains("x86_64") || osArch.contains("amd64")) {
+          return MACOS_X86;
         }
+      } else if (osName.contains("win")) {
+        return WINDOWS;
+      }
+
+      return UNSUPPORTED;
+    }
+  }
+
+  /**
+   * This method attempts to load the native library required for Limbo operations. It first tries
+   * to load the library from the system's library path using {@link #loadFromSystemPath()}. If that
+   * fails, it attempts to load the library from the JAR file using {@link #loadFromJar()}. If
+   * either method succeeds, the `isLoaded` flag is set to true. If both methods fail, an {@link
+   * InternalError} is thrown indicating that the necessary native library could not be loaded.
+   *
+   * @throws InternalError if the native library cannot be loaded from either the system path or the
+   *     JAR file.
+   */
+  public static void load() {
+    if (isLoaded) {
+      return;
     }
 
-    /**
-     * Loads the SQLite interface backend.
-     */
-    public static void load() {
-        if (isLoaded) return;
-
-        try {
-            System.loadLibrary("_limbo_java");
-        } finally {
-            isLoaded = true;
-        }
+    if (loadFromSystemPath() || loadFromJar()) {
+      isLoaded = true;
+      return;
     }
 
-    /**
-     * @param url      e.g. "jdbc:sqlite:fileName
-     * @param fileName e.g. path to file
-     */
-    public static LimboDB create(String url, String fileName) throws SQLException {
-        return new LimboDB(url, fileName);
+    throw new InternalError("Unable to load necessary native library");
+  }
+
+  /**
+   * Load the native library from the system path.
+   *
+   * <p>This method attempts to load the native library named "_limbo_java" from the system's
+   * library path. If the library is successfully loaded, the `isLoaded` flag is set to true.
+   *
+   * @return true if the library was successfully loaded, false otherwise.
+   */
+  private static boolean loadFromSystemPath() {
+    try {
+      System.loadLibrary("_limbo_java");
+      return true;
+    } catch (Throwable t) {
+      logger.info("Unable to load from default path: {}", String.valueOf(t));
     }
 
-    // TODO: receive config as argument
-    private LimboDB(String url, String fileName) {
-        super(url, fileName);
+    return false;
+  }
+
+  /**
+   * Load the native library from the JAR file.
+   *
+   * <p>By default, native libraries are packaged within the JAR file. This method extracts the
+   * appropriate native library for the current operating system and architecture from the JAR and
+   * loads it.
+   *
+   * @return true if the library was successfully loaded, false otherwise.
+   */
+  private static boolean loadFromJar() {
+    Architecture arch = Architecture.detect();
+    if (arch == Architecture.UNSUPPORTED) {
+      logger.info("Unsupported OS or architecture");
+      return false;
     }
 
-    // WRAPPER FUNCTIONS ////////////////////////////////////////////
-
-    // TODO: add support for JNI
-    @Override
-    protected synchronized native long openUtf8(byte[] file, int openFlags) throws SQLException;
-
-    // TODO: add support for JNI
-    @Override
-    protected synchronized native void close0() throws SQLException;
-
-    @Override
-    public synchronized int exec(String sql) throws SQLException {
-        // TODO: add implementation
-        throw new SQLFeatureNotSupportedException();
+    try {
+      InputStream is = LimboDB.class.getClassLoader().getResourceAsStream(arch.getLibPath());
+      assert is != null;
+      File file = convertInputStreamToFile(is, arch);
+      System.load(file.getPath());
+      return true;
+    } catch (Throwable t) {
+      logger.info("Unable to load from jar: {}", String.valueOf(t));
     }
 
-    // TODO: add support for JNI
-    synchronized native int execUtf8(byte[] sqlUtf8) throws SQLException;
+    return false;
+  }
 
-    // TODO: add support for JNI
-    @Override
-    public native void interrupt();
+  private static File convertInputStreamToFile(InputStream is, Architecture arch)
+      throws IOException {
+    File tempFile = File.createTempFile("lib", arch.getFileExtension());
+    tempFile.deleteOnExit();
 
-    @Override
-    protected void open0(String fileName, int openFlags) throws SQLException {
-        if (isOpen) {
-            throw buildLimboException(LimboErrorCode.ETC.code, "Already opened");
-        }
+    try (FileOutputStream os = new FileOutputStream(tempFile)) {
+      int read;
+      byte[] bytes = new byte[1024];
 
-        byte[] fileNameBytes = stringToUtf8ByteArray(fileName);
-        if (fileNameBytes == null) {
-            throw buildLimboException(LimboErrorCode.ETC.code, "File name cannot be converted to byteArray. File name: " + fileName);
-        }
-
-        dbPtr = openUtf8(fileNameBytes, openFlags);
-        isOpen = true;
+      while ((read = is.read(bytes)) != -1) {
+        os.write(bytes, 0, read);
+      }
     }
 
-    @Override
-    protected synchronized SafeStmtPtr prepare(String sql) throws SQLException {
-        // TODO: add implementation
-        throw new SQLFeatureNotSupportedException();
+    return tempFile;
+  }
+
+  /**
+   * @param url e.g. "jdbc:sqlite:fileName
+   * @param filePath e.g. path to file
+   */
+  public static LimboDB create(String url, String filePath) throws SQLException {
+    return new LimboDB(url, filePath);
+  }
+
+  // TODO: receive config as argument
+  private LimboDB(String url, String filePath) {
+    super(url, filePath);
+  }
+
+  // TODO: add support for JNI
+  @Override
+  protected native long openUtf8(byte[] file, int openFlags) throws SQLException;
+
+  // TODO: add support for JNI
+  @Override
+  protected native void close0() throws SQLException;
+
+  // TODO: add support for JNI
+  @Override
+  public native void interrupt();
+
+  @Override
+  protected void open0(String filePath, int openFlags) throws SQLException {
+    if (isOpen) {
+      throw LimboExceptionUtils.buildLimboException(
+          LimboErrorCode.LIMBO_ETC.code, "Already opened");
     }
 
-    // TODO: add support for JNI
-    @Override
-    protected synchronized native int finalize(long stmt);
-
-    // TODO: add support for JNI
-    @Override
-    public synchronized native int step(long stmt);
-
-    @VisibleForTesting
-    native void throwJavaException(int errorCode) throws SQLException;
-
-    /**
-     * Throws formatted SQLException with error code and message.
-     *
-     * @param errorCode         Error code.
-     * @param errorMessageBytes Error message.
-     */
-    @NativeInvocation
-    private void throwLimboException(int errorCode, byte[] errorMessageBytes) throws SQLException {
-        String errorMessage = utf8ByteBufferToString(errorMessageBytes);
-        throw buildLimboException(errorCode, errorMessage);
+    byte[] filePathBytes = stringToUtf8ByteArray(filePath);
+    if (filePathBytes == null) {
+      throw LimboExceptionUtils.buildLimboException(
+          LimboErrorCode.LIMBO_ETC.code,
+          "File path cannot be converted to byteArray. File name: " + filePath);
     }
 
-    /**
-     * Throws formatted SQLException with error code and message.
-     *
-     * @param errorCode    Error code.
-     * @param errorMessage Error message.
-     */
-    public LimboException buildLimboException(int errorCode, @Nullable String errorMessage) throws SQLException {
-        LimboErrorCode code = LimboErrorCode.getErrorCode(errorCode);
-        String msg;
-        if (code == LimboErrorCode.UNKNOWN_ERROR) {
-            msg = String.format("%s:%s (%s)", code, errorCode, errorMessage);
-        } else {
-            msg = String.format("%s (%s)", code, errorMessage);
-        }
+    dbPointer = openUtf8(filePathBytes, openFlags);
+    isOpen = true;
+  }
 
-        return new LimboException(msg, code);
-    }
+  @Override
+  public long connect() throws SQLException {
+    return connect0(dbPointer);
+  }
 
-    @Nullable
-    private static String utf8ByteBufferToString(@Nullable byte[] buffer) {
-        if (buffer == null) {
-            return null;
-        }
+  private native long connect0(long databasePtr) throws SQLException;
 
-        return new String(buffer, StandardCharsets.UTF_8);
-    }
+  @VisibleForTesting
+  native void throwJavaException(int errorCode) throws SQLException;
 
-    @Nullable
-    private static byte[] stringToUtf8ByteArray(@Nullable String str) {
-        if (str == null) {
-            return null;
-        }
-        return str.getBytes(StandardCharsets.UTF_8);
-    }
+  /**
+   * Throws formatted SQLException with error code and message.
+   *
+   * @param errorCode Error code.
+   * @param errorMessageBytes Error message.
+   */
+  @NativeInvocation(invokedFrom = "limbo_db.rs")
+  private void throwLimboException(int errorCode, byte[] errorMessageBytes) throws SQLException {
+    LimboExceptionUtils.throwLimboException(errorCode, errorMessageBytes);
+  }
 }
