@@ -255,8 +255,10 @@ impl Database {
         enable_indexes: bool,
         enable_views: bool,
     ) -> Result<Arc<Database>> {
-        if path == ":memory:" {
-            return Self::do_open_with_flags(
+        // turso-sync-engine create 2 databases with different names in the same IO if MemoryIO is used
+        // in this case we need to bypass registry (as this is MemoryIO DB) but also preserve original distinction in names (e.g. :memory:-draft and :memory:-synced)
+        if path.starts_with(":memory:") {
+            return Self::open_with_flags_bypass_registry(
                 io,
                 path,
                 db_file,
@@ -277,7 +279,7 @@ impl Database {
         if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
             return Ok(db);
         }
-        let db = Self::do_open_with_flags(
+        let db = Self::open_with_flags_bypass_registry(
             io,
             path,
             db_file,
@@ -291,7 +293,7 @@ impl Database {
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
-    fn do_open_with_flags(
+    fn open_with_flags_bypass_registry(
         io: Arc<dyn IO>,
         path: &str,
         db_file: Arc<dyn DatabaseStorage>,
@@ -411,7 +413,7 @@ impl Database {
             _shared_cache: false,
             cache_size: Cell::new(default_cache_size),
             page_size: Cell::new(page_size),
-            wal_checkpoint_disabled: Cell::new(false),
+            wal_auto_checkpoint_disabled: Cell::new(false),
             capture_data_changes: RefCell::new(CaptureDataChangesMode::Off),
             closed: Cell::new(false),
             attached_databases: RefCell::new(DatabaseCatalog::new()),
@@ -780,7 +782,9 @@ pub struct Connection {
     /// page size used for an uninitialized database or the next vacuum command.
     /// it's not always equal to the current page size of the database
     page_size: Cell<u32>,
-    wal_checkpoint_disabled: Cell<bool>,
+    /// Disable automatic checkpoint behaviour when DB is shutted down or WAL reach certain size
+    /// Client still can manually execute PRAGMA wal_checkpoint(...) commands
+    wal_auto_checkpoint_disabled: Cell<bool>,
     capture_data_changes: RefCell<CaptureDataChangesMode>,
     closed: Cell<bool>,
     /// Attached databases
@@ -981,21 +985,8 @@ impl Connection {
                         input,
                     )?;
 
-                    let mut stmt =
-                        Statement::new(program, self._db.mv_store.clone(), pager.clone());
-
-                    loop {
-                        match stmt.step()? {
-                            vdbe::StepResult::Done => {
-                                break;
-                            }
-                            vdbe::StepResult::IO => stmt.run_once()?,
-                            vdbe::StepResult::Row => {}
-                            vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                                return Err(LimboError::Busy)
-                            }
-                        }
-                    }
+                    Statement::new(program, self._db.mv_store.clone(), pager.clone())
+                        .run_ignore_rows()?;
                 }
                 _ => unreachable!(),
             }
@@ -1116,21 +1107,8 @@ impl Connection {
                         input,
                     )?;
 
-                    let mut stmt =
-                        Statement::new(program, self._db.mv_store.clone(), pager.clone());
-
-                    loop {
-                        match stmt.step()? {
-                            vdbe::StepResult::Done => {
-                                break;
-                            }
-                            vdbe::StepResult::IO => stmt.run_once()?,
-                            vdbe::StepResult::Row => {}
-                            vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                                return Err(LimboError::Busy)
-                            }
-                        }
-                    }
+                    Statement::new(program, self._db.mv_store.clone(), pager.clone())
+                        .run_ignore_rows()?;
                 }
             }
         }
@@ -1385,9 +1363,7 @@ impl Connection {
         if self.closed.get() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        self.pager
-            .borrow()
-            .wal_checkpoint(self.wal_checkpoint_disabled.get(), mode)
+        self.pager.borrow().wal_checkpoint(mode)
     }
 
     /// Close a connection and checkpoint.
@@ -1407,7 +1383,7 @@ impl Connection {
                     pager.end_tx(
                         true, // rollback = true for close
                         self,
-                        self.wal_checkpoint_disabled.get(),
+                        self.wal_auto_checkpoint_disabled.get(),
                     )
                 })?;
                 self.transaction_state.set(TransactionState::None);
@@ -1416,11 +1392,11 @@ impl Connection {
 
         self.pager
             .borrow()
-            .checkpoint_shutdown(self.wal_checkpoint_disabled.get())
+            .checkpoint_shutdown(self.wal_auto_checkpoint_disabled.get())
     }
 
-    pub fn wal_disable_checkpoint(&self) {
-        self.wal_checkpoint_disabled.set(true);
+    pub fn wal_auto_checkpoint_disable(&self) {
+        self.wal_auto_checkpoint_disabled.set(true);
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
@@ -1895,11 +1871,10 @@ impl Connection {
     pub fn copy_db(&self, file: &str) -> Result<()> {
         // use a new PlatformIO instance here to allow for copying in-memory databases
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
-        let disabled = false;
         // checkpoint so everything is in the DB file before copying
         self.pager
             .borrow_mut()
-            .wal_checkpoint(disabled, CheckpointMode::Truncate)?;
+            .wal_checkpoint(CheckpointMode::Truncate)?;
         self.pager.borrow_mut().db_file.copy_to(&*io, file)
     }
 
@@ -1969,6 +1944,19 @@ impl Statement {
         }
 
         res
+    }
+
+    pub(crate) fn run_ignore_rows(&mut self) -> Result<()> {
+        loop {
+            match self.step()? {
+                vdbe::StepResult::Done => return Ok(()),
+                vdbe::StepResult::IO => self.run_once()?,
+                vdbe::StepResult::Row => continue,
+                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
+                    return Err(LimboError::Busy)
+                }
+            }
+        }
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
