@@ -30,6 +30,7 @@ use crate::translate::expr::{
     ReturningValueRegisters, WalkControl,
 };
 use crate::translate::plan::{DeletePlan, JoinedTable, Plan, QueryDestination, Search};
+use crate::translate::planner::ROWID_STRS;
 use crate::translate::result_row::try_fold_expr_to_i64;
 use crate::translate::values::emit_values;
 use crate::translate::window::{emit_window_results, init_window, WindowMetadata};
@@ -307,6 +308,8 @@ pub fn emit_query<'a>(
             &plan.result_columns,
             &plan.order_by,
             &plan.table_references,
+            plan.group_by.is_some(),
+            &plan.aggregates,
         )?;
     }
 
@@ -1815,7 +1818,10 @@ fn rewrite_where_for_update_registers(
             }
             Expr::Id(ast::Name::Ident(name)) | Expr::Id(ast::Name::Quoted(name)) => {
                 let normalized = normalize_ident(name.as_str());
-                if normalized.eq_ignore_ascii_case("rowid") {
+                if ROWID_STRS
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(&normalized))
+                {
                     *e = Expr::Register(rowid_reg);
                 } else if let Some((idx, c)) = columns.iter().enumerate().find(|(_, c)| {
                     c.name
